@@ -5,6 +5,7 @@ MiniPix V2 Telegram Bot – Public Quiz Bypass
 - Multi‑account quiz (parallel) with stop button
 - Keys stored permanently
 - All original features preserved
+- Debug logs for login flow
 """
 
 import os
@@ -1350,11 +1351,12 @@ setgroq_conv = ConversationHandler(
         MessageHandler(filters.Regex("^🔑 Set Groq Key$"), set_groq_start),
     ],
     states={
-        WAIT_SETGROQ_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_groq_account)],
-        WAIT_SETGROQ_KEY1: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_groq_key1)],
-        WAIT_SETGROQ_KEY2: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_groq_key2)],
+        WAIT_SETGROQ_ACCOUNT: [MessageHandler(filters.TEXT, set_groq_account)],
+        WAIT_SETGROQ_KEY1: [MessageHandler(filters.TEXT, set_groq_key1)],
+        WAIT_SETGROQ_KEY2: [MessageHandler(filters.TEXT, set_groq_key2)],
     },
     fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=True,
 )
 
 
@@ -1405,6 +1407,8 @@ async def login_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Debug log to see if this handler is called
+    print(f"login_phone called with text: {update.message.text}")
     phone = update.message.text.strip()
     if not phone.startswith("+"):
         phone = "+91" + phone.lstrip("0")
@@ -1509,14 +1513,14 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Login Conversation Handler ───
 login_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],  # per_message removed
+    entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],
     states={
-        WAIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
-        WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
-        WAIT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_token)],
+        WAIT_PHONE: [MessageHandler(filters.TEXT, login_phone)],  # Simplified filter
+        WAIT_OTP: [MessageHandler(filters.TEXT, login_otp)],
+        WAIT_TOKEN: [MessageHandler(filters.TEXT, login_token)],
     },
     fallbacks=[CommandHandler("cancel", cancel)],
-    per_message=True,          # <--- Added here
+    per_message=True,
     allow_reentry=True,
 )
 
