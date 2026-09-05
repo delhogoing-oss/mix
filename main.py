@@ -4,8 +4,7 @@ MiniPix V2 Telegram Bot – Public Quiz Bypass
 - Per‑user, per‑account Groq keys (up to 2)
 - Multi‑account quiz (parallel) with stop button
 - Keys stored permanently
-- All original features preserved
-- Debug logs for login flow
+- Persistent conversation states (PicklePersistence)
 """
 
 import os
@@ -35,6 +34,7 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     filters,
+    PicklePersistence,
 )
 
 # ───────────────────────── Config ─────────────────────────
@@ -42,6 +42,7 @@ API_BASE = "https://api.minipix.co/v4"
 ACCOUNTS_FILE = "minipix_accounts.json"          # legacy – kept
 USER_DATA_FILE = "user_data.json"                # new: stores per‑user account data + keys
 LOCK_FILE = "bot.lock"
+CONVERSATION_FILE = "conversation_data"          # for PicklePersistence
 
 MAX_WATCHES_PER_EP = 4
 REWARDS_BY_WATCH = {1: 15, 2: 8, 3: 5, 4: 3}
@@ -1357,6 +1358,7 @@ setgroq_conv = ConversationHandler(
     },
     fallbacks=[CommandHandler("cancel", cancel)],
     per_message=True,
+    per_chat=True,
 )
 
 
@@ -1407,8 +1409,6 @@ async def login_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Debug log to see if this handler is called
-    print(f"login_phone called with text: {update.message.text}")
     phone = update.message.text.strip()
     if not phone.startswith("+"):
         phone = "+91" + phone.lstrip("0")
@@ -1511,16 +1511,17 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ─── Login Conversation Handler ───
+# ─── Login Conversation Handler (with persistence) ───
 login_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],
     states={
-        WAIT_PHONE: [MessageHandler(filters.TEXT, login_phone)],  # Simplified filter
+        WAIT_PHONE: [MessageHandler(filters.TEXT, login_phone)],
         WAIT_OTP: [MessageHandler(filters.TEXT, login_otp)],
         WAIT_TOKEN: [MessageHandler(filters.TEXT, login_token)],
     },
     fallbacks=[CommandHandler("cancel", cancel)],
     per_message=True,
+    per_chat=True,
     allow_reentry=True,
 )
 
@@ -1647,7 +1648,10 @@ def main():
 
 
 # ───────────────────── Global Application ─────────────────────
-app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+# Create a persistence instance so conversation states are shared across workers
+persistence = PicklePersistence(filepath=CONVERSATION_FILE)
+
+app = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("help", help_cmd))
@@ -1673,6 +1677,7 @@ app.add_handler(MessageHandler(filters.Regex("^⏹ Stop$"), stop_cmd))
 app.add_handler(MessageHandler(filters.Regex("^🔑 Set Groq Key$"), set_groq_start))
 app.add_handler(MessageHandler(filters.Regex("^ℹ️ Help$"), help_cmd))
 
+# Fallback for unmatched messages – but it won't interfere with conversation
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text("Use /help for commands.")))
 
 
