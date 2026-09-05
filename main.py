@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-MiniPix V2 Telegram Bot
-- Per-user Groq API keys (multiple allowed, fallback)
-- Primary model: openai/gpt-oss-120b
-- Lock file to avoid multiple instances
-- Quiz sessions 10–25 (default 15), 10s delay
-- Handles stale sessions (hearts=0) by retrying and aborting after 2 failures
-- Improved OTP login with detailed error logging
-- Added stop button / command to cancel long-running tasks
+MiniPix V2 Telegram Bot (Public Multi-User Version)
+- Dual Groq API keys per user with automatic fallback on rate limit/error
+- Public Multi-User isolation for accounts and sessions
+- Active Task Cancellation via /stop command or stop button
 """
 
 import os
@@ -47,7 +43,7 @@ LOCK_FILE = "bot.lock"
 
 MAX_WATCHES_PER_EP = 4
 REWARDS_BY_WATCH = {1: 15, 2: 8, 3: 5, 4: 3}
-QUIZ_QUESTION_DELAY = 10          # fixed to 10 seconds
+QUIZ_QUESTION_DELAY = 10  # fixed to 10 seconds
 
 GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -74,6 +70,9 @@ logger = logging.getLogger(__name__)
 
 (WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS) = range(4)
 
+# Active tasks tracking for stop signal
+stop_flags: Dict[int, bool] = {}
+
 
 # ───────────────────── Lock file ─────────────────────
 def acquire_lock():
@@ -84,13 +83,15 @@ def acquire_lock():
         print("Another bot instance is running. Exiting.")
         sys.exit(1)
 
-    def remove_lock():
-        try:
-            os.unlink(LOCK_FILE)
-        except Exception:
-            pass
 
-    atexit.register(remove_lock)
+def remove_lock():
+    try:
+        os.unlink(LOCK_FILE)
+    except Exception:
+        pass
+
+
+atexit.register(remove_lock)
 
 
 # ───────────────────── Log Channel ─────────────────────
@@ -112,19 +113,12 @@ def send_log_sync(text: str):
         logger.warning(f"Log channel error: {e}")
 
 
-# ───────────────────── User Groq Keys (multiple) ─────────────────────
+# ───────────────────── User Groq Keys (Supports Dual Keys) ─────────────────────
 def load_user_groq_keys() -> dict:
     if os.path.exists(USER_GROQ_FILE):
         try:
             with open(USER_GROQ_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # Ensure each value is a list
-                for uid, val in data.items():
-                    if isinstance(val, str):
-                        data[uid] = [val]
-                    elif not isinstance(val, list):
-                        data[uid] = []
-                return data
+                return json.load(f)
         except Exception:
             return {}
     return {}
@@ -143,20 +137,19 @@ user_groq_keys: dict = load_user_groq_keys()
 
 def get_user_groq_keys(user_id: int) -> List[str]:
     keys = user_groq_keys.get(str(user_id))
-    if keys and isinstance(keys, list):
-        return keys
+    if isinstance(keys, list):
+        return [k for k in keys if k]
+    elif isinstance(keys, str) and keys:
+        return [keys]
     if GLOBAL_GROQ_API_KEY:
         return [GLOBAL_GROQ_API_KEY]
     return []
 
 
-# ───────────────────── Stop flag ─────────────────────
-stop_flags: Dict[int, bool] = {}
-
-
 # ───────────────────── MiniPix Core ─────────────────────
 class MiniPixV2:
-    def __init__(self):
+    def __init__(self, telegram_user_id: int):
+        self.telegram_user_id = str(telegram_user_id)
         self.access_token = None
         self.user_id = None
         self.profile_id = None
@@ -178,17 +171,33 @@ class MiniPixV2:
                 with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict):
-                        return data.get("accounts", {}) if isinstance(data.get("accounts"), dict) else data
-                    return {}
+                        user_accs = data.get(self.telegram_user_id, {})
+                        if isinstance(user_accs, dict):
+                            return user_accs.get("accounts", {})
             except Exception:
                 return {}
         return {}
 
     def _save_accounts(self):
-        payload = {"accounts": self.accounts, "saved_at": date.today().isoformat()}
+        data = {}
+        if os.path.exists(ACCOUNTS_FILE):
+            try:
+                with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if not isinstance(data, dict):
+                        data = {}
+            except Exception:
+                data = {}
+        
+        if self.telegram_user_id not in data or not isinstance(data[self.telegram_user_id], dict):
+            data[self.telegram_user_id] = {}
+        
+        data[self.telegram_user_id]["accounts"] = self.accounts
+        data[self.telegram_user_id]["saved_at"] = date.today().isoformat()
+
         try:
             with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
+                json.dump(data, f, indent=2, ensure_ascii=False)
             return True
         except Exception:
             return False
@@ -270,11 +279,11 @@ class MiniPixV2:
         self.phone = phone
         payload = {"phone_number": phone}
         sc, data = self._req(
-            "POST", "/login/generate-otp",
+            "POST",
+            "/login/generate-otp",
             headers={"content-type": "application/json; charset=utf-8"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
-        # Log full response for debugging
         send_log_sync(
             f"📡 OTP generate response:\n"
             f"Status: {sc}\n"
@@ -300,7 +309,8 @@ class MiniPixV2:
             "session_token": session_token,
         }
         sc, data = self._req(
-            "POST", "/login/verify-otp",
+            "POST",
+            "/login/verify-otp",
             headers={"content-type": "application/json; charset=utf-8"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
@@ -499,17 +509,17 @@ class MiniPixV2:
             watched_list = profile.get("watched") or profile.get("watchHistory") or []
             if isinstance(watched_list, list):
                 raw_history = watched_list
-        if isinstance(getattr(self, "watch_history_raw", None), list):
-            raw_history = raw_history + self.watch_history_raw
-        for item in raw_history:
-            if not isinstance(item, dict):
-                continue
-            sid = item.get("id") or item.get("series_id")
-            ep = item.get("episodeNo") or item.get("episode_no")
-            pct = int(item.get("watchedPct") or item.get("progress") or 0)
-            if sid and ep and pct >= 80:
-                k = (str(sid), str(ep))
-                counts[k] = counts.get(k, 0) + 1
+            if isinstance(getattr(self, "watch_history_raw", None), list):
+                raw_history = raw_history + self.watch_history_raw
+            for item in raw_history:
+                if not isinstance(item, dict):
+                    continue
+                sid = item.get("id") or item.get("series_id")
+                ep = item.get("episodeNo") or item.get("episode_no")
+                pct = int(item.get("watchedPct") or item.get("progress") or 0)
+                if sid and ep and pct >= 80:
+                    k = (str(sid), str(ep))
+                    counts[k] = counts.get(k, 0) + 1
         runtime = getattr(self, "runtime_watch_counts", None)
         if isinstance(runtime, dict):
             for k, c in runtime.items():
@@ -717,6 +727,8 @@ class MiniPixV2:
         return True, "done"
 
     def browse_and_watch_all_smart_repeat(self, progress_callback=None, max_watches=250, telegram_user_id=None):
+        stop_flags[int(telegram_user_id)] = False
+
         def log(msg):
             if progress_callback:
                 progress_callback(msg)
@@ -742,65 +754,56 @@ class MiniPixV2:
         total_skipped = 0
         total_failed = 0
         balance_before = self.get_balance_silent()
-        stopped = False
 
-        try:
-            for si, s in enumerate(all_series, 1):
-                # Check stop flag
-                if stop_flags.get(telegram_user_id, False):
-                    log("⏹ Stopped by user.")
-                    stopped = True
+        for si, s in enumerate(all_series, 1):
+            if stop_flags.get(int(telegram_user_id)):
+                log("🛑 Task stopped by user.")
+                break
+            if total_watched >= max_watches:
+                log("Soft limit reached.")
+                break
+            sid = s.get("_id") or s.get("id") or s.get("series_id")
+            if not sid:
+                continue
+            title = s.get("title") or "?"
+            episodes, _ = self.get_episodes(sid, page=1, page_size=500)
+            if not episodes:
+                continue
+            episodes = sorted(
+                episodes,
+                key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
+            )
+            try:
+                self._start_task_for_series(sid)
+            except Exception:
+                pass
+
+            log(f"[{si}/{len(all_series)}] {title}")
+            done = 0
+            for ep in episodes:
+                if stop_flags.get(int(telegram_user_id)):
                     break
                 if total_watched >= max_watches:
-                    log("Soft limit reached.")
                     break
-                sid = s.get("_id") or s.get("id") or s.get("series_id")
-                if not sid:
+                ep_no = ep.get("episodeNo")
+                kp = (str(sid), str(ep_no))
+                cnt = watch_counts.get(kp, 0) + self.runtime_watch_counts.get(kp, 0)
+                if cnt >= MAX_WATCHES_PER_EP:
                     continue
-                title = s.get("title") or "?"
-                episodes, _ = self.get_episodes(sid, page=1, page_size=500)
-                if not episodes:
-                    continue
-                episodes = sorted(
-                    episodes,
-                    key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
-                )
-                try:
-                    self._start_task_for_series(sid)
-                except Exception:
-                    pass
-
-                log(f"[{si}/{len(all_series)}] {title}")
-                done = 0
-                for ep in episodes:
-                    if stop_flags.get(telegram_user_id, False):
-                        log("⏹ Stopped by user.")
-                        stopped = True
-                        break
-                    if total_watched >= max_watches:
-                        break
-                    ep_no = ep.get("episodeNo")
-                    kp = (str(sid), str(ep_no))
-                    cnt = watch_counts.get(kp, 0) + self.runtime_watch_counts.get(kp, 0)
-                    if cnt >= MAX_WATCHES_PER_EP:
-                        continue
-                    ok, st = self.watch_episode(ep, s, allow_repeat=True, nth_watch=cnt + 1)
-                    if st == "skip":
-                        total_skipped += 1
-                    elif ok:
-                        done += 1
-                        total_watched += 1
-                    else:
-                        total_failed += 1
-                if done:
-                    log(f"  → {done} watches done")
+                ok, st = self.watch_episode(ep, s, allow_repeat=True, nth_watch=cnt + 1)
+                if st == "skip":
+                    total_skipped += 1
+                elif ok:
+                    done += 1
+                    total_watched += 1
+                else:
+                    total_failed += 1
                 try:
                     self.claim_reward_task(series_id=sid)
                 except Exception:
                     pass
-        finally:
-            # Clear stop flag for this user
-            stop_flags.pop(telegram_user_id, None)
+            if done:
+                log(f" → {done} watches done")
 
         bal_end = self.get_balance_silent()
         delta = None
@@ -812,8 +815,6 @@ class MiniPixV2:
             f"User: <code>{telegram_user_id}</code>\n"
             f"Watched: {total_watched} | Skipped: {total_skipped} | Failed: {total_failed}\n"
         )
-        if stopped:
-            summary += "⏹ Stopped by user.\n"
         if delta is not None:
             summary += f"Balance: {balance_before} → {bal_end} ({delta:+d})"
         send_log_sync(summary)
@@ -825,7 +826,6 @@ class MiniPixV2:
             "balance_before": balance_before,
             "balance_after": bal_end,
             "delta": delta,
-            "stopped": stopped,
         }
 
     # ── QUIZ ──
@@ -913,7 +913,7 @@ class MiniPixV2:
             "Options:\n"
         )
         for i, opt in enumerate(options):
-            prompt += f"  {i}: {opt}\n"
+            prompt += f" {i}: {opt}\n"
         prompt += "\nCorrect option index (integer only): "
         return prompt
 
@@ -938,22 +938,23 @@ class MiniPixV2:
         return None
 
     def ask_groq(self, question, options, telegram_user_id: int = None):
-        keys = get_user_groq_keys(telegram_user_id) if telegram_user_id else []
-        if not keys:
-            if GLOBAL_GROQ_API_KEY:
-                keys = [GLOBAL_GROQ_API_KEY]
-            else:
-                send_log_sync(f"❌ No Groq key for user <code>{telegram_user_id}</code>")
-                return None, None, None
+        user_keys = get_user_groq_keys(telegram_user_id) if telegram_user_id else []
+        if not user_keys and GLOBAL_GROQ_API_KEY:
+            user_keys = [GLOBAL_GROQ_API_KEY]
+
+        if not user_keys:
+            send_log_sync(f"❌ No Groq keys available for user <code>{telegram_user_id}</code>")
+            return None, None, None
 
         prompt = self._build_quiz_prompt(question, options)
 
-        # Try each key, then each model
-        for key in keys:
+        # Dual token fallback evaluation loop
+        for k_idx, api_key in enumerate(user_keys, start=1):
             for model in GROQ_MODELS:
                 try:
                     from groq import Groq
-                    client = Groq(api_key=key)
+                    client = Groq(api_key=api_key)
+
                     completion = client.chat.completions.create(
                         model=model,
                         messages=[
@@ -971,27 +972,25 @@ class MiniPixV2:
                         temperature=0.0,
                         max_tokens=15,
                     )
+
                     answer_text = (completion.choices[0].message.content or "").strip()
                     idx = self._parse_quiz_answer(answer_text, options)
                     if idx is not None:
-                        return idx, model, answer_text
+                        return idx, f"K{k_idx}:{model}", answer_text
                 except Exception as e:
                     err = str(e).lower()
                     if "rate" in err or "limit" in err or "quota" in err or "429" in err:
-                        send_log_sync(f"⏳ Model {model} rate‑limited for key {key[:10]}..., trying next.")
-                        continue  # next model
-                    else:
-                        # Other errors, still try next model
+                        send_log_sync(f"⏳ Key #{k_idx} Model {model} rate‑limited. Trying next.")
                         continue
-            # All models failed for this key, move to next key
+                    logger.warning(f"Key #{k_idx} Model {model} failed: {e}")
+                    continue
 
-        # HTTP fallback with first key
-        if keys:
+            # HTTP fallback for current API key
             try:
                 r = requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={
-                        "Authorization": f"Bearer {keys[0]}",
+                        "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
                     json={
@@ -1012,9 +1011,9 @@ class MiniPixV2:
                     answer_text = r.json()["choices"][0]["message"]["content"].strip()
                     idx = self._parse_quiz_answer(answer_text, options)
                     if idx is not None:
-                        return idx, "http-fallback", answer_text
+                        return idx, f"K{k_idx}:http-fallback", answer_text
             except Exception as e:
-                send_log_sync(f"HTTP fallback error: {e}")
+                send_log_sync(f"HTTP fallback error on Key #{k_idx}: {e}")
 
         return None, None, None
 
@@ -1025,6 +1024,8 @@ class MiniPixV2:
         progress_callback=None,
         telegram_user_id=None,
     ):
+        stop_flags[int(telegram_user_id)] = False
+
         def log(msg):
             if progress_callback:
                 progress_callback(msg)
@@ -1044,204 +1045,200 @@ class MiniPixV2:
         sessions_done = 0
         debug_lines = []
         failed_attempts = 0
-        stopped = False
 
         send_log_sync(
             f"🧠 QUIZ STARTED | User <code>{telegram_user_id}</code> | Sessions: {max_sessions}"
         )
 
-        try:
-            for session_num in range(1, max_sessions + 1):
-                # Check stop flag
-                if stop_flags.get(telegram_user_id, False):
-                    log("⏹ Stopped by user.")
-                    stopped = True
+        for session_num in range(1, max_sessions + 1):
+            if stop_flags.get(int(telegram_user_id)):
+                log("🛑 Quiz stopped by user.")
+                break
+            log(f"--- Session {session_num}/{max_sessions} ---")
+
+            session_id, question_obj, session_meta = None, None, None
+            for attempt in range(2):
+                if stop_flags.get(int(telegram_user_id)):
+                    break
+                session_id, question_obj, session_meta = self.quiz_start_session()
+                if session_id and question_obj:
+                    break
+                if attempt == 0:
+                    log("⚠️ Session start failed, retrying in 3s...")
+                    time.sleep(3)
+
+            if stop_flags.get(int(telegram_user_id)):
+                log("🛑 Quiz stopped by user.")
+                break
+
+            if not session_id or not question_obj:
+                log("❌ Failed to start session after retry")
+                send_log_sync(f"❌ Session start failed | User <code>{telegram_user_id}</code>")
+                failed_attempts += 1
+                if failed_attempts >= 2:
+                    log("Aborting: too many failed attempts to start session.")
+                    break
+                time.sleep(3)
+                continue
+
+            hearts = session_meta.get("hearts", 3) if session_meta else 3
+
+            if hearts == 0:
+                log(f"💔 Session has 0 hearts – cannot continue.")
+                failed_attempts += 1
+                if failed_attempts >= 2:
+                    log("Aborting: repeated dead sessions.")
+                    break
+                time.sleep(5)
+                continue
+
+            failed_attempts = 0
+
+            ad_every = session_meta.get("adGateEvery", 5) if session_meta else 5
+            q_count = 0
+            session_coins = 0
+            correct_count = 0
+            wrong_count = 0
+
+            while True:
+                if stop_flags.get(int(telegram_user_id)):
+                    break
+                if hearts <= 0:
+                    log("No hearts left")
+                    break
+                if not question_obj or not isinstance(question_obj, dict):
                     break
 
-                log(f"--- Session {session_num}/{max_sessions} ---")
+                q_id = question_obj.get("questionId")
+                q_text_hi = question_obj.get("questionHi") or ""
+                q_text_en = question_obj.get("questionEn") or ""
+                options = question_obj.get("options", [])
+                q_idx = question_obj.get("index", q_count)
+                q_total = question_obj.get("total", "?")
 
-                # Attempt to start a session (with retry)
-                session_id, question_obj, session_meta = None, None, None
-                for attempt in range(2):
-                    session_id, question_obj, session_meta = self.quiz_start_session()
-                    if session_id and question_obj:
-                        break
-                    if attempt == 0:
-                        log("⚠️ Session start failed, retrying in 3s...")
-                        time.sleep(3)
+                q_count += 1
+                combined = q_text_hi
+                if q_text_en and q_text_en != q_text_hi:
+                    combined = f"{q_text_hi}\n[EN: {q_text_en}]" if q_text_hi else q_text_en
 
-                if not session_id or not question_obj:
-                    log("❌ Failed to start session after retry")
-                    send_log_sync(f"❌ Session start failed | User <code>{telegram_user_id}</code>")
-                    failed_attempts += 1
-                    if failed_attempts >= 2:
-                        log("Aborting: too many failed attempts to start session.")
-                        break
-                    time.sleep(3)
-                    continue
+                if not q_id or len(options) < 2:
+                    send_log_sync(f"⚠️ Invalid question: q_id={q_id}, options={len(options)}")
+                    break
 
-                hearts = session_meta.get("hearts", 3) if session_meta else 3
-
-                # If hearts == 0, this session is dead – treat as failure and retry
-                if hearts == 0:
-                    log(f"💔 Session has 0 hearts – cannot continue.")
-                    failed_attempts += 1
-                    if failed_attempts >= 2:
-                        log("Aborting: repeated dead sessions.")
-                        break
-                    time.sleep(5)
-                    continue
-
-                # Valid session – reset failure counter
-                failed_attempts = 0
-
-                ad_every = session_meta.get("adGateEvery", 5) if session_meta else 5
-                q_count = 0
-                session_coins = 0
-                correct_count = 0
-                wrong_count = 0
-
-                while True:
-                    if stop_flags.get(telegram_user_id, False):
-                        log("⏹ Stopped by user.")
-                        stopped = True
-                        break
-                    if hearts <= 0:
-                        log("No hearts left")
-                        break
-                    if not question_obj or not isinstance(question_obj, dict):
-                        break
-
-                    q_id = question_obj.get("questionId")
-                    q_text_hi = question_obj.get("questionHi") or ""
-                    q_text_en = question_obj.get("questionEn") or ""
-                    options = question_obj.get("options", [])
-                    q_idx = question_obj.get("index", q_count)
-                    q_total = question_obj.get("total", "?")
-
-                    q_count += 1
-                    combined = q_text_hi
-                    if q_text_en and q_text_en != q_text_hi:
-                        combined = f"{q_text_hi}\n[EN: {q_text_en}]" if q_text_hi else q_text_en
-
-                    if not q_id or len(options) < 2:
-                        send_log_sync(f"⚠️ Invalid question: q_id={q_id}, options={len(options)}")
-                        break
-
-                    correct_index, model_used, raw_answer = self.ask_groq(
-                        combined, options, telegram_user_id=telegram_user_id
-                    )
-                    if correct_index is None:
-                        removed = self.quiz_use_lifeline(session_id, q_id) or []
-                        remaining = [i for i in range(len(options)) if i not in set(removed)]
-                        correct_index = remaining[0] if remaining else 0
-                        model_used = "lifeline/guess"
-                        raw_answer = "N/A"
-                        send_log_sync(f"⚠️ Model failed → using lifeline/guess index: {correct_index}")
-
-                    correct_index = max(0, min(correct_index, len(options) - 1))
-                    chosen_text = options[correct_index]
-
-                    time.sleep(question_delay)
-
-                    result = self.quiz_submit_answer(session_id, q_id, correct_index)
-                    if not result:
-                        break
-
-                    if result.get("success"):
-                        correct_flag = result.get("correct", False)
-                        coins_earned = int(result.get("coinsEarned") or 0)
-                        session_coins = result.get("coinsSoFar", 0)
-                        hearts = int(result.get("hearts", hearts))
-                        total_coins += coins_earned
-                        if correct_flag:
-                            correct_count += 1
-                        else:
-                            wrong_count += 1
-
-                        status_emoji = "✅" if correct_flag else "❌"
-                        correct_idx_server = result.get("correctIndex")
-                        correct_server_text = ""
-                        if correct_idx_server is not None:
-                            try:
-                                correct_server_text = f" (Correct: {correct_idx_server} '{options[correct_idx_server]}')"
-                            except:
-                                pass
-                        debug_line = (
-                            f"Q{q_idx+1}/{q_total}: {status_emoji} | "
-                            f"Model: {model_used} | Raw: '{raw_answer[:30]}' | "
-                            f"Chose: [{correct_index}] {chosen_text}{correct_server_text} | "
-                            f"+{coins_earned}¢ | hearts {hearts}"
-                        )
-
-                        send_log_sync(f"<b>{debug_line}</b>")
-                        debug_lines.append(debug_line)
-                        if len(debug_lines) > 15:
-                            debug_lines.pop(0)
-
-                        user_debug = "\n".join(debug_lines)
-                        log(f"--- Quiz running ---\n{user_debug}")
-
-                        next_info = result.get("next")
-                        if not next_info:
-                            log(f"Session complete • {session_coins} coins")
-                            break
-
-                        if isinstance(next_info, dict):
-                            if "question" in next_info and isinstance(next_info.get("question"), dict):
-                                question_obj = next_info["question"]
-                                session_id = result.get("sessionId") or session_id
-                                continue
-                            if "result" in next_info:
-                                break
-                            if next_info.get("questionId"):
-                                question_obj = next_info
-                                session_id = result.get("sessionId") or session_id
-                                continue
-
-                        # Ad gate
-                        if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
-                            nq = self.quiz_ad_ack(session_id)
-                            if nq and isinstance(nq, dict):
-                                question_obj = nq
-                                continue
-                            else:
-                                break
-                        break
-                    else:
-                        break
-
-                session_summary = (
-                    f"🏁 Session {session_num} finished\n"
-                    f"Questions: {q_count}  |  Correct: {correct_count}  |  Wrong: {wrong_count}\n"
-                    f"Coins earned: {session_coins}"
+                correct_index, model_used, raw_answer = self.ask_groq(
+                    combined, options, telegram_user_id=telegram_user_id
                 )
-                log(session_summary)
-                send_log_sync(f"<b>{session_summary}</b>")
+                if correct_index is None:
+                    removed = self.quiz_use_lifeline(session_id, q_id) or []
+                    remaining = [i for i in range(len(options)) if i not in set(removed)]
+                    correct_index = remaining[0] if remaining else 0
+                    model_used = "lifeline/guess"
+                    raw_answer = "N/A"
+                    send_log_sync(f"⚠️ Model failed → using lifeline/guess index: {correct_index}")
 
-                sessions_done += 1
-                if session_num < max_sessions:
-                    time.sleep(2)
-        finally:
-            # Clear stop flag for this user
-            stop_flags.pop(telegram_user_id, None)
+                correct_index = max(0, min(correct_index, len(options) - 1))
+                chosen_text = options[correct_index]
+
+                # Delay check loop to allow fast stopping
+                for _ in range(question_delay):
+                    if stop_flags.get(int(telegram_user_id)):
+                        break
+                    time.sleep(1)
+
+                if stop_flags.get(int(telegram_user_id)):
+                    break
+
+                result = self.quiz_submit_answer(session_id, q_id, correct_index)
+                if not result:
+                    break
+
+                if result.get("success"):
+                    correct_flag = result.get("correct", False)
+                    coins_earned = int(result.get("coinsEarned") or 0)
+                    session_coins = result.get("coinsSoFar", 0)
+                    hearts = int(result.get("hearts", hearts))
+                    total_coins += coins_earned
+                    if correct_flag:
+                        correct_count += 1
+                    else:
+                        wrong_count += 1
+
+                    status_emoji = "✅" if correct_flag else "❌"
+                    correct_idx_server = result.get("correctIndex")
+                    correct_server_text = ""
+                    if correct_idx_server is not None:
+                        try:
+                            correct_server_text = f" (Correct: {correct_idx_server} '{options[correct_idx_server]}')"
+                        except Exception:
+                            pass
+                    debug_line = (
+                        f"Q{q_idx+1}/{q_total}: {status_emoji} | "
+                        f"Model: {model_used} | Raw: '{raw_answer[:30]}' | "
+                        f"Chose: [{correct_index}] {chosen_text}{correct_server_text} | "
+                        f"+{coins_earned}¢ | hearts {hearts}"
+                    )
+
+                    send_log_sync(f"<b>{debug_line}</b>")
+                    debug_lines.append(debug_line)
+                    if len(debug_lines) > 15:
+                        debug_lines.pop(0)
+
+                    user_debug = "\n".join(debug_lines)
+                    log(f"--- Quiz running ---\n{user_debug}")
+
+                    next_info = result.get("next")
+                    if not next_info:
+                        log(f"Session complete • {session_coins} coins")
+                        break
+
+                    if isinstance(next_info, dict):
+                        if "question" in next_info and isinstance(next_info.get("question"), dict):
+                            question_obj = next_info["question"]
+                            session_id = result.get("sessionId") or session_id
+                            continue
+                        if "result" in next_info:
+                            break
+                        if next_info.get("questionId"):
+                            question_obj = next_info
+                            session_id = result.get("sessionId") or session_id
+                            continue
+
+                    if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
+                        nq = self.quiz_ad_ack(session_id)
+                        if nq and isinstance(nq, dict):
+                            question_obj = nq
+                            continue
+                        else:
+                            break
+                    break
+                else:
+                    break
+
+            session_summary = (
+                f"🏁 Session {session_num} finished\n"
+                f"Questions: {q_count} | Correct: {correct_count} | Wrong: {wrong_count}\n"
+                f"Coins earned: {session_coins}"
+            )
+            log(session_summary)
+            send_log_sync(f"<b>{session_summary}</b>")
+
+            sessions_done += 1
+            if session_num < max_sessions and not stop_flags.get(int(telegram_user_id)):
+                time.sleep(2)
 
         final = (
             f"<b>🏁 QUIZ FINISHED</b>\n"
             f"User: <code>{telegram_user_id}</code>\n"
             f"Sessions: {sessions_done}\n"
             f"Total coins earned: ~{total_coins}\n"
-            f"Balance now: {self.get_balance()}\n"
+            f"Balance now: {self.get_balance()}"
         )
-        if stopped:
-            final += "⏹ Stopped by user."
         send_log_sync(final)
 
         return {
             "sessions": sessions_done,
             "total_coins": total_coins,
             "balance": self.get_balance(),
-            "stopped": stopped,
         }
 
 
@@ -1251,7 +1248,7 @@ user_bots: Dict[int, MiniPixV2] = {}
 
 def get_bot(user_id: int) -> MiniPixV2:
     if user_id not in user_bots:
-        user_bots[user_id] = MiniPixV2()
+        user_bots[user_id] = MiniPixV2(telegram_user_id=user_id)
     return user_bots[user_id]
 
 
@@ -1262,10 +1259,16 @@ def main_menu_keyboard():
             [KeyboardButton("👥 Accounts"), KeyboardButton("➕ Login")],
             [KeyboardButton("🎬 Watch All (4x)"), KeyboardButton("🧠 Quiz Status")],
             [KeyboardButton("🤖 Run Quiz"), KeyboardButton("🔑 Set Groq Key")],
-            [KeyboardButton("⏹ Stop"), KeyboardButton("ℹ️ Help")],
+            [KeyboardButton("🛑 Stop Task"), KeyboardButton("ℹ️ Help")],
         ],
         resize_keyboard=True,
     )
+
+
+def stop_inline_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 Stop Active Task", callback_data="task:stop")]
+    ])
 
 
 # ───────────────────── Handlers ─────────────────────
@@ -1274,17 +1277,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(user.id)
     text = (
         f"👋 Hi {user.first_name}!\n\n"
-        "MiniPix V2 Bot ready.\n\n"
-        "• /setgroq – apna Groq API key set karo (multiple allowed)\n"
-        "• /login – account login\n"
-        "• /watch – 4x watch\n"
-        "• /quiz – quiz status\n"
-        "• /stop – stop current task"
+        "MiniPix V2 Public Bot ready.\n\n"
+        "• /setgroq – apna 1 ya 2 Groq API keys set karo\n"
+        "• /login – apna account login karo\n"
+        "• /watch – 4x watch automation\n"
+        "• /quiz – quiz status check\n"
+        "• /stop – running task ko stop karo\n"
     )
     if bot.access_token:
-        text += f"\n\n✅ Logged in: {bot.current_account_label or bot.phone}"
+        text += f"\n✅ Logged in: {bot.current_account_label or bot.phone}"
     else:
-        text += "\n\n⚠️ Not logged in → /login"
+        text += "\n⚠️ Not logged in → /login"
     await update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
 
@@ -1298,11 +1301,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/login – OTP or Token login\n"
         "/watch – smart 4x watch\n"
         "/quiz – quiz status\n"
-        "/setgroq `gsk_xxx` – apna Groq key set karo (multiple allowed)\n"
-        "/mygroq – check your keys\n"
-        "/stop – stop current task (watch/quiz)\n"
+        "/setgroq `gsk_key1` `gsk_key2` – 1 ya 2 Groq keys set karein\n"
+        "/mygroq – saved Groq keys check karein\n"
+        "/stop – chal rahe task ko rokein\n"
         "/logout – logout\n\n"
-        "Groq key free: https://console.groq.com/keys",
+        "Free keys: https://console.groq.com/keys",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
@@ -1311,40 +1314,37 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "Usage:\n`/setgroq gsk_your_key_here`\n\n"
-            "Multiple keys allowed – use this command again to add another.\n"
-            "Free key: https://console.groq.com/keys",
+            "Usage:\n`/setgroq gsk_key1 gsk_key2`\n\n"
+            "Aap ek saath 2 keys add kar sakte hain. Agar 1st limits ho jaye to 2nd auto use hoga.\n"
+            "Free keys: https://console.groq.com/keys",
             parse_mode="Markdown",
         )
         return
 
-    key = context.args[0].strip()
-    if not key.startswith("gsk_"):
-        await update.message.reply_text("❌ Invalid key. Must start with `gsk_`")
+    keys = [k.strip() for k in context.args if k.strip().startswith("gsk_")]
+    if not keys:
+        await update.message.reply_text("❌ Invalid key format. Must start with `gsk_`")
         return
 
+    keys = keys[:2]
     user_id = str(update.effective_user.id)
-    keys = user_groq_keys.get(user_id, [])
-    if key not in keys:
-        keys.append(key)
-        user_groq_keys[user_id] = keys
-        save_user_groq_keys(user_groq_keys)
-        await update.message.reply_text(f"✅ Groq API key added! Total keys: {len(keys)}")
-    else:
-        await update.message.reply_text("⚠️ Key already exists.")
+    user_groq_keys[user_id] = keys
+    save_user_groq_keys(user_groq_keys)
+    
+    await update.message.reply_text(
+        f"✅ {len(keys)} Groq API key(s) saved!\nAb quiz solve kar sakte ho."
+    )
 
 
 async def my_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keys = user_groq_keys.get(str(update.effective_user.id), [])
+    keys = get_user_groq_keys(update.effective_user.id)
     if keys:
         masked = [k[:10] + "..." + k[-4:] for k in keys]
-        await update.message.reply_text(
-            f"✅ Keys ({len(keys)}):\n" + "\n".join(masked),
-            parse_mode="Markdown"
-        )
+        msg = "\n".join([f"Key {i+1}: `{m}`" for i, m in enumerate(masked)])
+        await update.message.reply_text(f"✅ Saved Keys:\n{msg}", parse_mode="Markdown")
     else:
         await update.message.reply_text(
-            "❌ Koi key set nahi hai.\n\n`/setgroq gsk_xxxxxxxx`",
+            "❌ Koi key set nahi hai.\n\n`/setgroq gsk_key1 gsk_key2`",
             parse_mode="Markdown",
         )
 
@@ -1386,7 +1386,7 @@ async def accounts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, lbl in enumerate(accs, 1):
         acc = bot.accounts[lbl]
         ph = acc.get("phone") or "?"
-        lines.append(f"{i}. {lbl}  |  {ph}")
+        lines.append(f"{i}. {lbl} | {ph}")
         keyboard.append([
             InlineKeyboardButton(f"Switch → {lbl}", callback_data=f"sw:{lbl}"),
             InlineKeyboardButton("❌", callback_data=f"rm:{lbl}"),
@@ -1440,7 +1440,6 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     if not phone.startswith("+"):
         phone = "+91" + phone.lstrip("0")
-    # Basic validation
     if not re.match(r"^\+[1-9]\d{1,14}$", phone):
         await update.message.reply_text("❌ Invalid phone number. Use format: +91XXXXXXXXXX")
         return WAIT_PHONE
@@ -1452,7 +1451,6 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ OTP bhejne me fail. Check:\n"
             "• Phone number is correct\n"
-            "• Internet connection\n"
             "• Server is reachable\n\n"
             "Try again with /login"
         )
@@ -1508,9 +1506,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    stop_flags[user_id] = True
-    await update.message.reply_text("⏹ Stopping current task... (wait a moment)")
+    uid = update.effective_user.id
+    stop_flags[uid] = True
+    await update.message.reply_text("🛑 Stop signal sent. Task jaldi hi ruk jayega.")
+
+
+async def task_stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    stop_flags[uid] = True
+    await query.edit_message_text("🛑 Task stopping...")
 
 
 async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1520,14 +1526,19 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # Clear any stale stop flag
-    stop_flags.pop(uid, None)
-    msg = await update.message.reply_text("🚀 Starting smart 4x watch...\nThoda time lagega.")
+    stop_flags[uid] = False
+    msg = await update.message.reply_text(
+        "🚀 Starting smart 4x watch...\nThoda time lagega.",
+        reply_markup=stop_inline_keyboard()
+    )
 
     def progress(text):
         try:
             asyncio.get_event_loop().create_task(
-                msg.edit_text(f"🚀 Watching...\n\n{text[-900:]}")
+                msg.edit_text(
+                    f"🚀 Watching...\n\n{text[-900:]}",
+                    reply_markup=stop_inline_keyboard()
+                )
             )
         except Exception:
             pass
@@ -1554,8 +1565,6 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if result.get("delta") is not None:
         text += f"💰 {result['balance_before']} → {result['balance_after']} ({result['delta']:+d})"
-    if result.get("stopped"):
-        text += "\n⏹ Stopped by user."
     await msg.edit_text(text)
 
 
@@ -1593,9 +1602,9 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not get_user_groq_keys(update.effective_user.id):
         await update.message.reply_text(
-            "❌ Pehle apna Groq API key set karo:\n\n"
-            "`/setgroq gsk_xxxxxxxx`\n\n"
-            "Free key: https://console.groq.com/keys",
+            "❌ Pehle apne Groq API key(s) set karo:\n\n"
+            "`/setgroq gsk_key1 gsk_key2`\n\n"
+            "Free keys: https://console.groq.com/keys",
             parse_mode="Markdown",
         )
         return ConversationHandler.END
@@ -1615,15 +1624,20 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     sessions = context.user_data.get("quiz_sessions", 15)
     telegram_uid = update.effective_user.id
+    stop_flags[telegram_uid] = False
 
-    # Clear any stale stop flag
-    stop_flags.pop(telegram_uid, None)
-    msg = await update.message.reply_text(f"🤖 Running {sessions} sessions (delay 10s)...")
+    msg = await update.message.reply_text(
+        f"🤖 Running {sessions} sessions (delay 10s)...",
+        reply_markup=stop_inline_keyboard()
+    )
 
     def progress(text):
         try:
             asyncio.get_event_loop().create_task(
-                msg.edit_text(f"🤖 Quiz running...\n\n{text[-900:]}")
+                msg.edit_text(
+                    f"🤖 Quiz running...\n\n{text[-900:]}",
+                    reply_markup=stop_inline_keyboard()
+                )
             )
         except Exception:
             pass
@@ -1642,15 +1656,12 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "error" in result:
         await msg.edit_text(f"❌ {result['error']}")
     else:
-        text = (
+        await msg.edit_text(
             f"🏁 Quiz done\n"
             f"Sessions: {result.get('sessions')}\n"
             f"Coins this run: ~{result.get('total_coins')}\n"
             f"Current balance: {result.get('balance')}"
         )
-        if result.get("stopped"):
-            text += "\n⏹ Stopped by user."
-        await msg.edit_text(text)
     return ConversationHandler.END
 
 
@@ -1678,11 +1689,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await quiz_run_start(update, context)
     elif text == "🔑 Set Groq Key":
         await update.message.reply_text(
-            "Apna Groq key bhejo:\n`/setgroq gsk_xxxxxxxx`\n\n"
-            "Free key: https://console.groq.com/keys",
+            "Apne 1 ya 2 Groq keys bhejo:\n`/setgroq gsk_key1 gsk_key2`\n\n"
+            "Free keys: https://console.groq.com/keys",
             parse_mode="Markdown",
         )
-    elif text == "⏹ Stop":
+    elif text == "🛑 Stop Task":
         await stop_cmd(update, context)
     elif text == "ℹ️ Help":
         await help_cmd(update, context)
@@ -1732,9 +1743,10 @@ def main():
     app.add_handler(CommandHandler("quiz", quiz_status_cmd))
     app.add_handler(CommandHandler("setgroq", set_groq))
     app.add_handler(CommandHandler("mygroq", my_groq))
-    app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(sw|rm):"))
+    app.add_handler(CallbackQueryHandler(task_stop_callback, pattern=r"^task:stop$"))
     app.add_handler(login_conv)
     app.add_handler(quiz_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
