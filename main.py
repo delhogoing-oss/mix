@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 MiniPix V2 Telegram Bot – Public Quiz Bypass
-- Per‑user, per‑account Groq keys (up to 2 per account)
-- Login data sent to log channel
+- Per‑user, per‑account Groq keys (up to 2)
 - Multi‑account quiz (parallel) with stop button
-- Keys stored permanently (reusable next day)
-- All original features (watch, balance, campaign, etc.) preserved
+- Keys stored permanently
+- All original features preserved
 """
 
 import os
@@ -70,6 +69,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Conversation states (extended)
 (WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS,
  WAIT_SETGROQ_ACCOUNT, WAIT_SETGROQ_KEY1, WAIT_SETGROQ_KEY2) = range(7)
 
@@ -111,7 +111,7 @@ def send_log_sync(text: str):
         logger.warning(f"Log channel error: {e}")
 
 
-# ───────────────────── User Data (per‑user, per‑account) ─────────────────────
+# ───────────────────── User Data ─────────────────────
 def load_user_data() -> dict:
     if os.path.exists(USER_DATA_FILE):
         try:
@@ -137,13 +137,6 @@ def get_user_accounts(user_id: int) -> dict:
     return user_data.get(str(user_id), {}).get("accounts", {})
 
 
-def get_account_groq_keys(user_id: int, account_label: str) -> List[str]:
-    accs = get_user_accounts(user_id)
-    if account_label in accs:
-        return accs[account_label].get("groq_keys", [])
-    return []
-
-
 def set_account_groq_keys(user_id: int, account_label: str, keys: List[str]):
     uid = str(user_id)
     if uid not in user_data:
@@ -162,7 +155,7 @@ def add_account_to_user(user_id: int, account_label: str, account_data: dict):
     save_user_data(user_data)
 
 
-# ───────────────────── MiniPix Core (full original + enhancements) ─────────────────────
+# ───────────────────── MiniPix Core (full) ─────────────────────
 class MiniPixV2:
     def __init__(self, account_data: dict = None):
         if account_data is None:
@@ -280,7 +273,7 @@ class MiniPixV2:
         except Exception as e:
             return 0, str(e)
 
-    # ---------- LOGIN (enhanced) ----------
+    # ---------- LOGIN ----------
     def login_otp_generate(self, phone):
         self.phone = phone
         payload = {"phone_number": phone}
@@ -390,7 +383,7 @@ class MiniPixV2:
             }
         return {"enabled": False, "cap": 0, "used": 0, "reached": False, "blockWatching": False}
 
-    # ---------- SERIES DISCOVERY (full original) ----------
+    # ---------- SERIES DISCOVERY ----------
     def _collect_series_deep(self, obj, out_dict):
         if obj is None:
             return
@@ -531,7 +524,7 @@ class MiniPixV2:
                 counts[k] = max(counts.get(k, 0), c)
         return counts
 
-    # ---------- WATCH EPISODE (full original) ----------
+    # ---------- WATCH EPISODE ----------
     def _update_watch_progress(
         self, series_id, series_title, hindi_title, episode_no,
         tc_in_ms, tc_out_ms, detail_image, watched_pct,
@@ -827,7 +820,7 @@ class MiniPixV2:
             "delta": delta,
         }
 
-    # ── QUIZ (enhanced with multi‑key and stop support) ──
+    # ── QUIZ (enhanced) ──
     def get_quiz_status(self):
         sc, data = self._req("GET", "/quiz/status")
         if sc == 200 and isinstance(data, dict) and data.get("success"):
@@ -1145,7 +1138,13 @@ class MiniPixV2:
         }
 
 
-# ───────────────────── Task Manager (per user) ─────────────────────
+# ───────────────────── Cancel function (must be defined before ConversationHandlers) ─────────────────────
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled.", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+
+# ───────────────────── Task Manager ─────────────────────
 user_tasks: Dict[int, Dict[str, Any]] = {}
 
 async def run_quiz_all(user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1344,6 +1343,7 @@ async def set_groq_key2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ─── Set Groq Key Conversation Handler ───
 setgroq_conv = ConversationHandler(
     entry_points=[
         CommandHandler("setgroq", set_groq_start),
@@ -1383,7 +1383,7 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("ℹ️ No running task.")
 
 
-# ---------- LOGIN (enhanced) ----------
+# ---------- LOGIN ----------
 async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📱 Phone + OTP", callback_data="login:otp")],
@@ -1507,9 +1507,17 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled.", reply_markup=main_menu_keyboard())
-    return ConversationHandler.END
+# ─── Login Conversation Handler ───
+login_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],
+    states={
+        WAIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
+        WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
+        WAIT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_token)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    allow_reentry=True,
+)
 
 
 # ---------- Other commands ----------
@@ -1631,17 +1639,6 @@ def main():
         return
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    login_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],
-        states={
-            WAIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
-            WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
-            WAIT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_token)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
