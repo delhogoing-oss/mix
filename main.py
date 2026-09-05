@@ -1718,30 +1718,30 @@ async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if text == "💰 Balance":
+    text = (update.message.text or "").strip().lower()
+    if text == "💰 balance" or text == "balance":
         await balance_cmd(update, context)
-    elif text == "📊 Campaign":
+    elif text == "📊 campaign" or text == "campaign":
         await campaign_cmd(update, context)
-    elif text == "👥 Accounts":
+    elif text == "👥 accounts" or text == "accounts":
         await accounts_cmd(update, context)
-    elif text == "➕ Login":
+    elif text == "➕ login" or text == "login":
         await login_start(update, context)
-    elif text == "🎬 Watch All (4x)":
+    elif text == "🎬 watch all (4x)" or text == "watch all (4x)" or text == "watch":
         await watch_cmd(update, context)
-    elif text == "🧠 Quiz Status":
+    elif text == "🧠 quiz status" or text == "quiz status":
         await quiz_status_cmd(update, context)
-    elif text == "🤖 Run Quiz":
+    elif text == "🤖 run quiz" or text == "run quiz":
         return await quiz_run_start(update, context)
-    elif text == "🔑 Set Groq Key":
+    elif text == "🔑 set groq key" or text == "set groq key":
         await update.message.reply_text(
             "Apna Groq key bhejo:\n`/setgroq gsk_xxxxxxxx`\n\n"
             "Free key: https://console.groq.com/keys",
             parse_mode="Markdown",
         )
-    elif text == "⏹ Stop":
+    elif "stop" in text:
         await stop_cmd(update, context)
-    elif text == "ℹ️ Help":
+    elif text == "ℹ️ help" or text == "help":
         await help_cmd(update, context)
     else:
         await update.message.reply_text("Unknown. Use /help")
