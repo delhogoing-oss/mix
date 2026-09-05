@@ -1138,7 +1138,7 @@ class MiniPixV2:
         }
 
 
-# ───────────────────── Cancel function (must be defined before ConversationHandlers) ─────────────────────
+# ───────────────────── Cancel function ─────────────────────
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
@@ -1509,7 +1509,7 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Login Conversation Handler ───
 login_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],
+    entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:", per_message=True)],
     states={
         WAIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
         WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
@@ -1638,42 +1638,43 @@ def main():
         print("ERROR: Set TELEGRAM_BOT_TOKEN")
         return
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("balance", balance_cmd))
-    app.add_handler(CommandHandler("campaign", campaign_cmd))
-    app.add_handler(CommandHandler("accounts", accounts_cmd))
-    app.add_handler(CommandHandler("mykeys", mykeys_cmd))
-    app.add_handler(CommandHandler("login", login_start))
-    app.add_handler(CommandHandler("watch", watch_cmd))
-    app.add_handler(CommandHandler("quiz", quiz_status_cmd))
-    app.add_handler(CommandHandler("quizall", quizall_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
-    app.add_handler(CommandHandler("logout", logout_cmd))
-    app.add_handler(CallbackQueryHandler(stop_callback, pattern="^stop_task$"))
-    app.add_handler(login_conv)
-    app.add_handler(setgroq_conv)
-
-    # Button handlers
-    app.add_handler(MessageHandler(filters.Regex("^📊 Accounts$"), accounts_cmd))
-    app.add_handler(MessageHandler(filters.Regex("^🔑 My Keys$"), mykeys_cmd))
-    app.add_handler(MessageHandler(filters.Regex("^➕ Login$"), login_start))
-    app.add_handler(MessageHandler(filters.Regex("^🤖 Run Quiz All$"), quizall_cmd))
-    app.add_handler(MessageHandler(filters.Regex("^⏹ Stop$"), stop_cmd))
-    app.add_handler(MessageHandler(filters.Regex("^🔑 Set Groq Key$"), set_groq_start))
-    app.add_handler(MessageHandler(filters.Regex("^ℹ️ Help$"), help_cmd))
-
-    # Default fallback
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text("Use /help for commands.")))
-
-    print("Bot starting (lock acquired).")
-    if LOG_CHANNEL_ID:
-        print(f"Log channel enabled: {LOG_CHANNEL_ID}")
-    else:
-        print("WARNING: LOG_CHANNEL_ID not set")
+    # The app is already defined globally, so we just run it
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+# ───────────────────── Global Application ─────────────────────
+# Create the Application instance at module level so Gunicorn can find it.
+# We do this after all handlers are defined.
+app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+# Add all handlers to the app
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("help", help_cmd))
+app.add_handler(CommandHandler("balance", balance_cmd))
+app.add_handler(CommandHandler("campaign", campaign_cmd))
+app.add_handler(CommandHandler("accounts", accounts_cmd))
+app.add_handler(CommandHandler("mykeys", mykeys_cmd))
+app.add_handler(CommandHandler("login", login_start))
+app.add_handler(CommandHandler("watch", watch_cmd))
+app.add_handler(CommandHandler("quiz", quiz_status_cmd))
+app.add_handler(CommandHandler("quizall", quizall_cmd))
+app.add_handler(CommandHandler("stop", stop_cmd))
+app.add_handler(CommandHandler("logout", logout_cmd))
+app.add_handler(CallbackQueryHandler(stop_callback, pattern="^stop_task$"))
+app.add_handler(login_conv)
+app.add_handler(setgroq_conv)
+
+# Button handlers
+app.add_handler(MessageHandler(filters.Regex("^📊 Accounts$"), accounts_cmd))
+app.add_handler(MessageHandler(filters.Regex("^🔑 My Keys$"), mykeys_cmd))
+app.add_handler(MessageHandler(filters.Regex("^➕ Login$"), login_start))
+app.add_handler(MessageHandler(filters.Regex("^🤖 Run Quiz All$"), quizall_cmd))
+app.add_handler(MessageHandler(filters.Regex("^⏹ Stop$"), stop_cmd))
+app.add_handler(MessageHandler(filters.Regex("^🔑 Set Groq Key$"), set_groq_start))
+app.add_handler(MessageHandler(filters.Regex("^ℹ️ Help$"), help_cmd))
+
+# Default fallback
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text("Use /help for commands.")))
 
 
 if __name__ == "__main__":
