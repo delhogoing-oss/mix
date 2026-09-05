@@ -1509,13 +1509,14 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Login Conversation Handler ───
 login_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:", per_message=True)],
+    entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],  # per_message removed
     states={
         WAIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
         WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
         WAIT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_token)],
     },
     fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=True,          # <--- Added here
     allow_reentry=True,
 )
 
@@ -1638,16 +1639,12 @@ def main():
         print("ERROR: Set TELEGRAM_BOT_TOKEN")
         return
 
-    # The app is already defined globally, so we just run it
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 # ───────────────────── Global Application ─────────────────────
-# Create the Application instance at module level so Gunicorn can find it.
-# We do this after all handlers are defined.
 app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-# Add all handlers to the app
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("help", help_cmd))
 app.add_handler(CommandHandler("balance", balance_cmd))
@@ -1664,7 +1661,6 @@ app.add_handler(CallbackQueryHandler(stop_callback, pattern="^stop_task$"))
 app.add_handler(login_conv)
 app.add_handler(setgroq_conv)
 
-# Button handlers
 app.add_handler(MessageHandler(filters.Regex("^📊 Accounts$"), accounts_cmd))
 app.add_handler(MessageHandler(filters.Regex("^🔑 My Keys$"), mykeys_cmd))
 app.add_handler(MessageHandler(filters.Regex("^➕ Login$"), login_start))
@@ -1673,7 +1669,6 @@ app.add_handler(MessageHandler(filters.Regex("^⏹ Stop$"), stop_cmd))
 app.add_handler(MessageHandler(filters.Regex("^🔑 Set Groq Key$"), set_groq_start))
 app.add_handler(MessageHandler(filters.Regex("^ℹ️ Help$"), help_cmd))
 
-# Default fallback
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text("Use /help for commands.")))
 
 
