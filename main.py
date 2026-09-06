@@ -536,11 +536,66 @@ class MiniPixV2:
         send_log_sync(f"❌ OTP verify failed: {sc} {json.dumps(data, ensure_ascii=False)[:300]}")
         return False
 
+    def _discover_user_from_token(self, token):
+        try:
+            import base64
+            parts = token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1].replace("-", "+").replace("_", "/")
+                padding = "=" * ((4 - len(payload_b64) % 4) % 4)
+                decoded = base64.urlsafe_b64decode(payload_b64 + padding)
+                claims = json.loads(decoded.decode("utf-8", errors="replace"))
+                for k in ("sub", "user_id", "userId", "id", "_id", "uid"):
+                    if claims.get(k):
+                        return str(claims[k])
+        except Exception:
+            pass
+        tmp_s = requests.Session()
+        tmp_s.headers.update(HEADERS_BASE)
+        tmp_s.headers["authorization"] = f"Bearer {token}"
+        for path in ("/users/me", "/me", "/user/me", "/auth/me"):
+            try:
+                r = tmp_s.get(f"{API_BASE}{path}", timeout=15)
+                if r.status_code == 200:
+                    d = r.json()
+                    if isinstance(d, dict):
+                        uid = d.get("_id") or d.get("id") or d.get("user_id") or d.get("userId")
+                        if isinstance(uid, (dict, list)):
+                            uid = None
+                        if uid:
+                            return str(uid)
+            except Exception:
+                pass
+        for path in ("/users", "/users?limit=1"):
+            try:
+                r = tmp_s.get(f"{API_BASE}{path}", timeout=15)
+                if r.status_code == 200:
+                    d = r.json()
+                    if isinstance(d, list) and len(d) > 0:
+                        uid = d[0].get("_id") or d[0].get("id")
+                        if uid:
+                            return str(uid)
+                    if isinstance(d, dict):
+                        for k in ("data", "items", "users", "results"):
+                            lst = d.get(k)
+                            if isinstance(lst, list) and len(lst) > 0:
+                                uid = lst[0].get("_id") or lst[0].get("id")
+                                if uid:
+                                    return str(uid)
+                        uid = d.get("_id") or d.get("id")
+                        if uid and not isinstance(uid, (dict, list)):
+                            return str(uid)
+            except Exception:
+                pass
+        return None
+
     def login_with_token(self, token, user_id=None, profile_id=None, label=None):
         self.access_token = token
+        self.session.headers["authorization"] = f"Bearer {self.access_token}"
+        if not user_id:
+            user_id = self._discover_user_from_token(token)
         self.user_id = user_id
         self.profile_id = profile_id
-        self.session.headers["authorization"] = f"Bearer {self.access_token}"
         if not self.get_user():
             return False
         self.last_login_raw = {
@@ -755,6 +810,13 @@ class MiniPixV2:
             if sid and ep and pct >= 80:
                 k = (str(sid), str(ep))
                 counts[k] = counts.get(k, 0) + 1
+        if isinstance(self.watch_history, dict):
+            for (sid, ep_no), info in self.watch_history.items():
+                pct = int(info.get("watchedPct") or 0) if isinstance(info, dict) else 0
+                if pct >= 80:
+                    k = (str(sid), str(ep_no))
+                    if counts.get(k, 0) < 1:
+                        counts[k] = max(counts.get(k, 0), 1)
         runtime = getattr(self, "runtime_watch_counts", None)
         if isinstance(runtime, dict):
             for k, c in runtime.items():
@@ -810,6 +872,7 @@ class MiniPixV2:
         for path in (
             f"/users/{self.user_id}/profiles/{self.profile_id}/watch-history/update",
             "/watch-history/update",
+            f"/profiles/{self.profile_id}/watch-history/update",
         ):
             try:
                 sc2, d2 = self._req(
@@ -827,6 +890,11 @@ class MiniPixV2:
     def _report_watch_progress_to_coins(self, series_id, episode_no, watched_pct, series_title=""):
         if not (self.user_id and self.profile_id):
             return False
+        try:
+            watched_pct = int(watched_pct or 0)
+        except Exception:
+            watched_pct = 0
+        ep_str = str(episode_no)
         bodies = [
             {
                 "series_id": series_id,
@@ -840,17 +908,28 @@ class MiniPixV2:
             {
                 "type": "watch_ladder",
                 "seriesId": series_id,
-                "episode": str(episode_no),
+                "episode": ep_str,
                 "watched": watched_pct,
+                "campaign": False,
+            },
+            {
+                "task_id": f"watch_ladder_{series_id}",
+                "progress_delta": 1,
+                "series_id": series_id,
+                "episode_no": episode_no,
                 "campaign": False,
             },
         ]
         endpoints = [
             ("POST", "/coins/progress-report", bodies[0]),
             ("POST", "/coins/tasks/progress", bodies[0]),
+            ("POST", f"/coins/tasks/watch_ladder_{series_id}/progress", bodies[0]),
             ("POST", "/coins/watch-progress", bodies[1]),
+            ("POST", "/coins/report-watched", bodies[1]),
+            ("POST", "/coins/tasks/update", bodies[2]),
             ("POST", "/watch-ladder/progress", bodies[0]),
         ]
+        any_ok = False
         for method, path, body in endpoints:
             try:
                 sc, d = self._req(
@@ -858,11 +937,16 @@ class MiniPixV2:
                     headers={"content-type": "application/json; charset=utf-8"},
                     data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                 )
-                if sc and sc < 500 and isinstance(d, dict) and (d.get("success") is True or sc == 200):
-                    return True
+                if sc and sc < 500 and isinstance(d, dict):
+                    if d.get("success") is True:
+                        any_ok = True
+                        break
+                    if sc == 200 and "success" not in d:
+                        any_ok = True
+                        break
             except Exception:
                 continue
-        return False
+        return any_ok
 
     def _start_task_for_series(self, series_id):
         task_id = f"watch_ladder_{series_id}"
@@ -870,7 +954,10 @@ class MiniPixV2:
             ("POST", f"/coins/tasks/{task_id}/start", {"series_id": series_id, "campaign": False}),
             ("POST", "/coins/tasks/start", {"task_id": task_id, "series_id": series_id, "campaign": False}),
             ("POST", "/watch-ladder/start", {"series_id": series_id, "campaign": False}),
+            ("POST", "/coins/start-task", {"task_id": task_id, "campaign": False}),
+            ("POST", f"/coins/tasks/{task_id}/resume", {}),
         ]
+        any_ok = False
         for method, path, body in candidates:
             try:
                 sc, d = self._req(
@@ -879,25 +966,39 @@ class MiniPixV2:
                     data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                 )
                 if sc and sc < 500:
-                    return True
+                    if isinstance(d, dict) and d.get("success") is True:
+                        any_ok = True
+                        break
+                    if sc == 200:
+                        any_ok = True
+                        break
             except Exception:
                 pass
-        return False
+        return any_ok
 
     def claim_reward_task(self, task_id=None, series_id=None):
         if not task_id and series_id:
             task_id = f"watch_ladder_{series_id}"
+        if series_id:
+            try:
+                self._report_watch_progress_to_coins(series_id, 0, 100)
+            except Exception:
+                pass
         candidates = []
         if task_id:
-            candidates.extend([
-                ("POST", f"/coins/tasks/{task_id}/claim", None),
-                ("POST", "/coins/tasks/claim", {"task_id": task_id, "campaign": False}),
-            ])
+            candidates.append(("POST", f"/coins/tasks/{task_id}/claim", None))
+            candidates.append(("POST", "/coins/tasks/claim", {"task_id": task_id, "campaign": False}))
+            candidates.append(("POST", f"/coins/tasks/{task_id}/reward", None))
+            candidates.append(("POST", f"/coins/tasks/{task_id}/complete", {}))
+            candidates.append(("POST", "/coins/tasks/complete", {"task_id": task_id, "campaign": False}))
         if series_id:
-            candidates.extend([
-                ("POST", "/watch-ladder/claim", {"series_id": series_id, "campaign": False}),
-                ("POST", f"/coins/watch-ladder/{series_id}/claim", None),
-            ])
+            candidates.append(("POST", f"/watch-ladder/claim", {"series_id": series_id, "campaign": False}))
+            candidates.append(("POST", f"/coins/watch-ladder/{series_id}/claim", None))
+            candidates.append(("POST", f"/coins/claim", {"series_id": series_id, "type": "watch_ladder", "campaign": False}))
+            candidates.append(("POST", "/coins/redeem", {"series_id": series_id, "task": "watch_ladder", "campaign": False}))
+            candidates.append(("POST", f"/watch-ladder/{series_id}/complete", {"campaign": False}))
+        any_ok = False
+        last_msg = ""
         for entry in candidates:
             method, path = entry[0], entry[1]
             body = entry[2] if len(entry) > 2 else None
@@ -907,23 +1008,46 @@ class MiniPixV2:
                     headers={"content-type": "application/json; charset=utf-8"},
                     data=json.dumps(body, ensure_ascii=False).encode("utf-8") if body else None,
                 )
-                if sc and sc < 500 and isinstance(data, dict) and data.get("success") is True:
-                    return True
+                if sc and sc < 500 and isinstance(data, dict):
+                    if data.get("success") is True:
+                        any_ok = True
+                        break
+                    if data.get("success") is False:
+                        last_msg = data.get("message") or data.get("error") or str(data)[:80]
+                    if sc == 200 and "success" not in data:
+                        continue
+                elif sc and sc < 500 and isinstance(data, str):
+                    if sc == 200 and len(data or "") > 0:
+                        any_ok = True
+                        break
             except Exception:
                 continue
-        return False
+        return any_ok
 
-    def watch_episode(self, episode, series_info, allow_repeat=False, nth_watch=None):
-        if not isinstance(series_info, dict) or not isinstance(episode, dict):
-            return False, "invalid"
-        series_id = series_info.get("_id") or series_info.get("id") or series_info.get("series_id")
+    def watch_episode(
+        self,
+        episode,
+        series_info,
+        delay_multiplier=0.0,
+        min_watch_pct=80,
+        allow_repeat=False,
+        nth_watch=None,
+    ):
+        if not isinstance(series_info, dict):
+            return False, "invalid_series"
+        if not isinstance(episode, dict):
+            return False, "invalid_episode"
+        series_id = (
+            series_info.get("_id")
+            or series_info.get("id")
+            or series_info.get("series_id")
+        )
         if not series_id:
             return False, "no_series_id"
         ep_no = episode.get("episodeNo") or episode.get("episode_no") or episode.get("number") or 0
         series_title = series_info.get("title") or ""
         hindi_title = series_info.get("hindiTitle") or series_title
         detail_image = series_info.get("cardImage") or series_info.get("longVerticalImage") or ""
-
         try:
             tc_in = int(episode.get("tcIn") or 0)
         except Exception:
@@ -936,29 +1060,66 @@ class MiniPixV2:
             tc_out = tc_in + 60
         tc_in_ms = tc_in * 1000
         tc_out_ms = tc_out * 1000
-
+        dur_sec = tc_out - tc_in
         history_key = (series_id, ep_no)
         current_pct = int(self.watch_history.get(history_key, {}).get("watchedPct", 0) or 0)
-        if not allow_repeat and current_pct >= 80:
+        if not allow_repeat and current_pct >= min_watch_pct:
             return True, "skip"
 
-        for pct in [1, 50, 80, 99, 100]:
-            self._update_watch_progress(
+        progress_steps = [1, 50, 80, 99, 100, 100]
+        any_fail = False
+        reported_coin_progress = False
+        for pct in progress_steps:
+            if not allow_repeat and pct < current_pct:
+                continue
+            ok = self._update_watch_progress(
                 series_id, series_title, hindi_title, ep_no,
                 tc_in_ms, tc_out_ms, detail_image, pct,
             )
-            if pct >= 80:
-                self._report_watch_progress_to_coins(series_id, ep_no, pct, series_title)
-            time.sleep(0.12)
-
+            if not ok:
+                any_fail = True
+            if pct >= 80 and not reported_coin_progress:
+                try:
+                    self._report_watch_progress_to_coins(series_id, ep_no, pct, series_title)
+                    reported_coin_progress = True
+                except Exception:
+                    pass
+            if delay_multiplier > 0:
+                try:
+                    idx_cur = progress_steps.index(pct)
+                    prev_pct = progress_steps[idx_cur - 1] if idx_cur > 0 else 0
+                    delta = pct - prev_pct
+                    delay = (dur_sec * delay_multiplier * delta / 100)
+                    if delay > 0:
+                        time.sleep(min(delay, 2))
+                except Exception:
+                    time.sleep(0.15)
+            else:
+                time.sleep(0.15)
+        if not reported_coin_progress:
+            try:
+                self._report_watch_progress_to_coins(series_id, ep_no, 100, series_title)
+            except Exception:
+                pass
+        bal_before = self.get_balance_silent()
         try:
             self.claim_reward_task(series_id=series_id)
         except Exception:
             pass
-
+        time.sleep(0.6)
+        bal_after = self.get_balance_silent()
         self.watch_history[history_key] = {"watchedPct": 100, "time": tc_out_ms}
         rk = (str(series_id), str(ep_no))
         self.runtime_watch_counts[rk] = self.runtime_watch_counts.get(rk, 0) + 1
+        self.watch_history_raw.append({
+            "id": series_id,
+            "series_id": series_id,
+            "episodeNo": ep_no,
+            "episode_no": ep_no,
+            "watchedPct": 100,
+            "progress": 100,
+            "time": tc_out_ms,
+        })
         return True, "done"
 
     def browse_and_watch_all_smart_repeat(self, progress_callback=None, max_watches=250, telegram_user_id=None):
@@ -1301,39 +1462,74 @@ class MiniPixV2:
 
         prompt = self._build_quiz_prompt(question, options)
 
+        last_answer_text = ""
         for key in keys:
             for model in GROQ_MODELS:
                 try:
                     from groq import Groq
                     client = Groq(api_key=key)
-                    completion = client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a smart quiz solver. "
-                                    "Read the question and options carefully. "
-                                    "Reply with ONLY a single integer number (0, 1, 2 or 3). "
-                                    "Do not write any explanation or extra text."
-                                )
-                            },
-                            {"role": "user", "content": prompt}
-                        ],
-                        temperature=0.0,
-                        max_tokens=15,
-                    )
-                    answer_text = (completion.choices[0].message.content or "").strip()
+                    try:
+                        completion = client.chat.completions.create(
+                            model=model,
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "You are a smart quiz solver. "
+                                        "Read the question and options carefully. "
+                                        "Reply with ONLY a single integer number (0, 1, 2 or 3). "
+                                        "Do not write any explanation or extra text."
+                                    )
+                                },
+                                {"role": "user", "content": prompt}
+                            ],
+                            temperature=1,
+                            max_completion_tokens=2048,
+                            top_p=1,
+                            reasoning_effort="medium",
+                            stream=True,
+                            stop=None,
+                        )
+                        parts = []
+                        for chunk in completion:
+                            try:
+                                delta = chunk.choices[0].delta.content or ""
+                                if delta:
+                                    parts.append(delta)
+                            except Exception:
+                                pass
+                        answer_text = "".join(parts).strip()
+                        last_answer_text = answer_text
+                        if not answer_text:
+                            c2 = client.chat.completions.create(
+                                model=model,
+                                messages=[
+                                    {"role": "system", "content": "Reply with ONLY one integer: 0, 1, 2 or 3. Nothing else."},
+                                    {"role": "user", "content": prompt}
+                                ],
+                                temperature=1,
+                                max_completion_tokens=2048,
+                                top_p=1,
+                                reasoning_effort="medium",
+                                stream=False,
+                                stop=None,
+                            )
+                            answer_text = (c2.choices[0].message.content or "").strip()
+                            last_answer_text = answer_text
+                    except Exception as e:
+                        err = str(e).lower()
+                        if "rate" in err or "limit" in err or "quota" in err or "429" in err:
+                            send_log_sync(f"⏳ Model {model} rate‑limited for key {key[:10]}..., trying next.")
+                            continue
+                        else:
+                            continue
                     idx = self._parse_quiz_answer(answer_text, options)
                     if idx is not None:
                         return idx, model, answer_text
-                except Exception as e:
-                    err = str(e).lower()
-                    if "rate" in err or "limit" in err or "quota" in err or "429" in err:
-                        send_log_sync(f"⏳ Model {model} rate‑limited for key {key[:10]}..., trying next.")
-                        continue
-                    else:
-                        continue
+                except ImportError:
+                    break
+                except Exception:
+                    continue
 
         if keys:
             try:
@@ -1348,14 +1544,18 @@ class MiniPixV2:
                         "messages": [
                             {
                                 "role": "system",
-                                "content": "Reply with ONLY one number: 0, 1, 2 or 3. Nothing else."
+                                "content": "Reply with ONLY one integer: 0, 1, 2 or 3. Nothing else."
                             },
                             {"role": "user", "content": prompt}
                         ],
-                        "temperature": 0.0,
-                        "max_tokens": 10,
+                        "temperature": 1,
+                        "max_completion_tokens": 2048,
+                        "top_p": 1,
+                        "reasoning_effort": "medium",
+                        "stream": False,
+                        "stop": None,
                     },
-                    timeout=45,
+                    timeout=60,
                 )
                 if r.status_code == 200:
                     answer_text = r.json()["choices"][0]["message"]["content"].strip()
@@ -1552,6 +1752,14 @@ class MiniPixV2:
                                 session_id = result.get("sessionId") or session_id
                                 continue
                             if "result" in next_info:
+                                rinfo = next_info["result"]
+                                if isinstance(rinfo, dict):
+                                    lvl_result = (
+                                        f"🏁 Level result: Score {rinfo.get('scorePct')}% | "
+                                        f"Pass: {rinfo.get('passed')} | Coins: {rinfo.get('coins')}"
+                                    )
+                                    log(lvl_result)
+                                    send_log_sync(lvl_result)
                                 break
                             if next_info.get("questionId"):
                                 question_obj = next_info
@@ -1565,6 +1773,16 @@ class MiniPixV2:
                                 continue
                             else:
                                 break
+
+                        if isinstance(next_info, list) and "question" in str(next_info):
+                            if result.get("question") and isinstance(result.get("question"), dict):
+                                question_obj = result["question"]
+                                session_id = result.get("sessionId") or session_id
+                                continue
+                        if result.get("question") and isinstance(result.get("question"), dict):
+                            question_obj = result["question"]
+                            session_id = result.get("sessionId") or session_id
+                            continue
                         break
                     else:
                         break
