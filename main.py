@@ -24,6 +24,8 @@ Bug fixes
 *  Telegram flood-control: progress edits ab throttled + RetryAfter safe.
 *  quizzes_solved har log-line par bump ho raha tha. Ab per-session.
 *  Infinite `while any_progress` loop ke liye safety cap.
+*  QUIZ SOLVING: error handling improved, session/claim failures now set state,
+   model default changed to openai/gpt-oss-120b (override with GROQ_MODEL).
 """
 
 import asyncio
@@ -96,7 +98,7 @@ except ImportError:
 
     BadRequest = Forbidden = NetworkError = RetryAfter = TimedOut = _TelegramMissing
     print("[!] python-telegram-bot install nahi mila. Install karo:")
-    print("    pip install 'python-telegram-bot[rate-limiter]==21.*'")
+    print("    pip install 'python-telegram-bot[rate-limiter]==21.*' requests")
 
 try:
     from telegram.ext import AIORateLimiter
@@ -1514,8 +1516,12 @@ class MiniPixUserSession:
 
         chosen_index, reasoning = -1, None
         try:
+            # Use the model specified, but if it fails, you can change the default.
+            # The model "openai/gpt-oss-120b" might not be available on Groq.
+            # Set GROQ_MODEL environment variable to override.
+            model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
             body = {
-                "model": os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
                 "max_tokens": 256,
@@ -1536,8 +1542,11 @@ class MiniPixUserSession:
                 if choices:
                     raw_txt = (choices[0].get("message") or {}).get("content") or ""
                     chosen_index, reasoning = self._parse_quiz_json(raw_txt, len(opts))
-        except Exception:
-            pass
+            else:
+                # Log the error but continue
+                print(f"[!] Groq API error {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"[!] Groq call exception: {e}")
 
         if chosen_index is not None and 0 <= int(chosen_index) < len(opts):
             result = (int(chosen_index), reasoning or "groq")
@@ -1646,7 +1655,7 @@ class MiniPixUserSession:
 
         if not self.groq_api_key:
             emit(type="error", message="Groq API key set nahi hai --- /set_groq_key use karo")
-            return {"sessions": 0, "correct": 0, "questions": 0, "coins": 0, "delta": 0}
+            return {"sessions": 0, "correct": 0, "questions": 0, "coins": 0, "delta": 0, "error": "no_key"}
 
         bal_start = self.get_balance_silent()
         sessions_done = total_correct = total_questions = total_coins = 0
@@ -1658,8 +1667,8 @@ class MiniPixUserSession:
 
             emit(type="session_start", session=session_num, of=max_sessions)
             sess = self.quiz_start_session()
-            if not sess:
-                emit(type="session_failed", session=session_num)
+            if not sess or not sess.get("success"):
+                emit(type="session_failed", session=session_num, error="start_failed")
                 continue
 
             session_id = sess.get("sessionId") or sess.get("session_id")
@@ -1676,6 +1685,7 @@ class MiniPixUserSession:
                 opts = q.get("options") or []
                 chosen, _reason = self.solve_quiz_with_groq(q, opts)
                 if chosen < 0:
+                    # fallback to first option if Groq fails
                     chosen = 0
                 resp = self.quiz_submit_answer(session_id, qid, chosen)
                 correct = False
@@ -1691,6 +1701,8 @@ class MiniPixUserSession:
                 emit(type="answer", session=session_num, q=q_idx, correct=correct)
 
             ok, coins = self.quiz_claim_final(session_id)
+            if not ok:
+                emit(type="session_claim_failed", session=session_num, error="claim_failed")
             coins = int(coins or 0)
             total_coins += coins
             total_correct += correct_count
@@ -2036,8 +2048,20 @@ def worker_quiz(tg_uid, acc, job, sessions=5):
                 STORE.bump_account(tg_uid, aid, quizzes=1, coins=int(ev.get("coins") or 0))
                 if ev.get("coins"):
                     STATS.bump(tg_uid, "total_coins_earned", int(ev["coins"]))
+            elif kind == "session_failed":
+                job.set(aid, state="error", note=f"session {ev.get('session')} start failed",
+                        error=ev.get("error", "start_failed"))
+            elif kind == "session_claim_failed":
+                job.set(aid, state="error", note="claim failed", error="claim_failed")
+            elif kind == "error":
+                job.set(aid, state="error", note=ev.get("message", "unknown error"),
+                        error=ev.get("message"))
 
         result = session.run_auto_quiz(max_sessions=sessions, cancel=job.cancel, on_event=on_event)
+
+        # If no sessions succeeded, mark error
+        if result.get("sessions", 0) == 0 and not job.cancel.is_set():
+            job.set(aid, state="error", note="no quiz sessions completed", error="all_failed")
 
         state = "stopped" if job.cancel.is_set() else "done"
         job.set(
@@ -3250,7 +3274,7 @@ def main():
         print("    pip install 'python-telegram-bot[rate-limiter]==21.*' requests flask")
         sys.exit(1)
 
-    config = BOT_CONFIG
+    config = BotConfig.load()
     token = config.bot_token
     if not token:
         print("[X] BOT_TOKEN nahi mila. Environment variable set karo ya bot_config.json banao.")
