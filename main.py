@@ -1052,6 +1052,107 @@ class MiniPixV2:
             "stopped": stopped,
         }
 
+    def watch_series_smart_repeat(
+        self, series_id, progress_callback=None, max_total_watches=None, telegram_user_id=None,
+    ):
+        def log(msg):
+            if progress_callback:
+                progress_callback(msg)
+
+        log("Fetching series info & episodes...")
+        all_series = self.get_all_series(page_size=200, max_pages=5)
+        series_info = None
+        for s in all_series:
+            sid = s.get("_id") or s.get("id") or s.get("series_id")
+            if sid == series_id:
+                series_info = s
+                break
+        if not series_info:
+            return {"error": f"Series {series_id} not found"}
+
+        episodes, _ = self.get_episodes(series_id, page=1, page_size=500)
+        if not episodes:
+            return {"error": "No episodes"}
+        episodes = sorted(
+            episodes,
+            key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
+        )
+        title = series_info.get("title") or "Series"
+
+        try:
+            self.get_profile()
+        except Exception:
+            pass
+        watch_counts = self.get_watch_counts_from_profile()
+
+        total_watched = 0
+        total_skipped = 0
+        total_failed = 0
+        balance_before = self.get_balance_silent()
+        stopped = False
+
+        try:
+            self._start_task_for_series(series_id)
+        except Exception:
+            pass
+
+        budget = max_total_watches or (len(episodes) * MAX_WATCHES_PER_EP)
+
+        try:
+            for wi in range(1, MAX_WATCHES_PER_EP + 1):
+                if total_watched >= budget:
+                    break
+                log(f"--- Pass {wi}/{MAX_WATCHES_PER_EP} | {len(episodes)} eps ---")
+                for ei, ep in enumerate(episodes, 1):
+                    if stop_flags.get(telegram_user_id, False):
+                        log("⏹ Stopped by user.")
+                        stopped = True
+                        break
+                    if total_watched >= budget:
+                        break
+                    ep_no = ep.get("episodeNo")
+                    kp = (str(series_id), str(ep_no))
+                    cnt = watch_counts.get(kp, 0) + self.runtime_watch_counts.get(kp, 0)
+                    if cnt >= wi:
+                        if wi == 1:
+                            total_skipped += 1
+                        continue
+                    log(f"  → {title} E{ep_no} (watch #{wi}/{MAX_WATCHES_PER_EP}) | +{REWARDS_BY_WATCH[wi]} coins")
+                    ok, st = self.watch_episode(ep, series_info, allow_repeat=True, nth_watch=wi)
+                    if st == "skip":
+                        total_skipped += 1
+                    elif ok:
+                        total_watched += 1
+                    else:
+                        total_failed += 1
+                if stopped:
+                    break
+        finally:
+            stop_flags.pop(telegram_user_id, None)
+
+        try:
+            self.claim_reward_task(series_id=series_id)
+        except Exception:
+            pass
+
+        bal_end = self.get_balance_silent()
+        delta = None
+        if balance_before is not None and bal_end is not None:
+            delta = bal_end - balance_before
+
+        return {
+            "series_id": series_id,
+            "title": title,
+            "episodes": len(episodes),
+            "watched": total_watched,
+            "skipped": total_skipped,
+            "failed": total_failed,
+            "balance_before": balance_before,
+            "balance_after": bal_end,
+            "delta": delta,
+            "stopped": stopped,
+        }
+
     # ── QUIZ ──
     def get_quiz_status(self):
         sc, data = self._req("GET", "/quiz/status")
@@ -1473,13 +1574,88 @@ def main_menu_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("💰 Balance"), KeyboardButton("📊 Campaign")],
-            [KeyboardButton("👥 Accounts"), KeyboardButton("➕ Login")],
-            [KeyboardButton("🎬 Watch All (4x)"), KeyboardButton("🧠 Quiz Status")],
-            [KeyboardButton("🤖 Run Quiz"), KeyboardButton("🔑 Set Groq Key")],
-            [KeyboardButton("⏹ Stop"), KeyboardButton("ℹ️ Help")],
+            [KeyboardButton("👥 Accounts"), KeyboardButton("➕ Login"), KeyboardButton("🔑 Token Login")],
+            [KeyboardButton("🎬 Watch Series"), KeyboardButton("🎬 Watch All (4x)")],
+            [KeyboardButton("🧠 Quiz Status"), KeyboardButton("🤖 Run Quiz")],
+            [KeyboardButton("🔑 Set Groq Key"), KeyboardButton("⏹ Stop")],
+            [KeyboardButton("ℹ️ Help")],
         ],
         resize_keyboard=True,
     )
+
+
+# ───────────────────── Series / Episode helpers ─────────────────────
+def _split_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def build_series_keyboard(series_list, page=0, per_page=20):
+    total = len(series_list)
+    start = page * per_page
+    end = min(start + per_page, total)
+    chunk = series_list[start:end]
+
+    buttons = []
+    for s in chunk:
+        sid = s.get("_id") or s.get("id") or s.get("series_id")
+        title = s.get("title") or s.get("hindiTitle") or "???"
+        eps = s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0
+        short = title if len(title) < 25 else title[:23] + "…"
+        buttons.append([
+            InlineKeyboardButton(f"🎬 {short} [{eps} eps]", callback_data=f"ser:{sid}:0"),
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"sp:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"Page {page + 1}/{(total + per_page - 1) // per_page}", callback_data="noop"))
+    if end < total:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"sp:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_episode_keyboard(series_id, episodes, mp_instance: MiniPixV2, force_refresh=False):
+    if force_refresh:
+        try:
+            mp_instance.get_profile()
+        except Exception:
+            pass
+    counts = mp_instance.get_watch_counts_from_profile()
+    rt = mp_instance.runtime_watch_counts or {}
+
+    row1 = [
+        InlineKeyboardButton("⚡ Watch All (4x)", callback_data=f"all:{series_id}"),
+        InlineKeyboardButton("🔙 Series List", callback_data="slist"),
+    ]
+
+    ep_buttons = []
+    for ep in episodes:
+        ep_no = ep.get("episodeNo")
+        kp = (str(series_id), str(ep_no))
+        cnt = counts.get(kp, 0) + rt.get(kp, 0)
+        title = ep.get("title") or f"E{ep_no}"
+        dur = ep.get("tcOut") or ep.get("durationMinutes") or ""
+        dur_str = f"{dur}m" if dur else ""
+        if cnt >= MAX_WATCHES_PER_EP:
+            label = f"E{ep_no} ✔{cnt}x FULL"
+            action = f"rew:{series_id}:{ep_no}"
+        elif cnt > 0:
+            label = f"E{ep_no} {cnt}x/{MAX_WATCHES_PER_EP}"
+            action = f"rew:{series_id}:{ep_no}"
+        else:
+            label = f"▶ E{ep_no}"
+            action = f"ep:{series_id}:{ep_no}"
+
+        ep_buttons.append([
+            InlineKeyboardButton(label, callback_data=action),
+        ])
+
+    rows = [row1] + ep_buttons
+    return InlineKeyboardMarkup(rows)
 
 
 # ───────────────────── Handlers ─────────────────────
@@ -1509,8 +1685,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/balance – coin balance\n"
         "/campaign – watch campaign\n"
         "/accounts – list / switch accounts\n"
-        "/login – OTP or Token login\n"
-        "/watch – smart 4x watch\n"
+        "/login – OTP or Token login (interactive)\n"
+        "/tokenlogin `<token>` – Direct Access Token login (fast!)\n"
+        "/series – choose series & episodes (watch / rewatch)\n"
+        "/watch – watch selected series/episodes (same as /series)\n"
+        "/watchall – auto watch EVERYTHING 4x smart (old mode)\n"
         "/quiz – quiz status\n"
         "/setgroq `gsk_xxx` – apna Groq key set karo (multiple allowed)\n"
         "/mygroq – check your keys\n"
@@ -1579,6 +1758,420 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💰 Coin Balance: *{coins}*", parse_mode="Markdown")
 
 
+# ──────────────── Series / Episode Watch Handlers ────────────────
+async def watch_series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    bot = get_bot(uid)
+    if not bot.access_token:
+        await update.message.reply_text("Not logged in. Use /login")
+        return
+    if is_busy(uid):
+        await update.message.reply_text("⏳ Pehle se ek task chal raha hai. Poora hone do ya /stop use karo.")
+        return
+
+    msg = await update.message.reply_text("🔍 Series list fetch ho raha hai...")
+    loop = asyncio.get_running_loop()
+    series_list = await loop.run_in_executor(None, lambda: bot.get_all_series(page_size=200, max_pages=6))
+    if not series_list:
+        await msg.edit_text("❌ Koi series nahi mili.")
+        return
+
+    context.user_data["series_list_cache"] = [(
+        s.get("_id") or s.get("id") or s.get("series_id"),
+        s.get("title") or s.get("hindiTitle") or "???",
+        int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0),
+        s,
+    ) for s in series_list if (s.get("_id") or s.get("id") or s.get("series_id"))]
+
+    total_eps = sum(e for _, _, e, _ in context.user_data["series_list_cache"])
+    header = (
+        f"🎬 Choose a Series to Watch:\n\n"
+        f"Total series: {len(context.user_data['series_list_cache'])}\n"
+        f"Total episodes across all: {total_eps}\n\n"
+        f"Per-episode 4x rewards: 15 → 8 → 5 → 3 coins"
+    )
+    kb = build_series_keyboard(series_list, page=0, per_page=20)
+    await msg.edit_text(header, reply_markup=kb)
+
+
+async def _get_series_obj(series_id, series_cache):
+    for sid, title, eps, raw in (series_cache or []):
+        if sid == series_id:
+            return raw
+    return None
+
+
+async def _render_series_episodes(query, context, series_id, msg_to_edit=None):
+    uid = query.from_user.id
+    bot = get_bot(uid)
+    cache = context.user_data.get("series_list_cache") or []
+    series_obj = _get_series_obj(series_id, cache)
+    title = None
+    for sid, ttl, eps, raw in cache:
+        if sid == series_id:
+            title = ttl
+            if not series_obj:
+                series_obj = raw
+            break
+
+    loop = asyncio.get_running_loop()
+    episodes, _ = await loop.run_in_executor(None, lambda: bot.get_episodes(series_id, page=1, page_size=500))
+    if not episodes:
+        return "❌ Is series mein koi episode nahi mili.", None
+
+    episodes_sorted = sorted(
+        episodes,
+        key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
+    )
+
+    context.user_data["current_series_id"] = series_id
+    context.user_data[f"episodes_{series_id}"] = episodes_sorted
+
+    if not series_obj:
+        for s in await loop.run_in_executor(None, lambda: bot.get_all_series(page_size=500, max_pages=10)):
+            if (s.get("_id") or s.get("id")) == series_id:
+                series_obj = s
+                break
+    title = series_obj.get("title") or series_obj.get("hindiTitle") or title or "Series" if series_obj else (title or "Series")
+    context.user_data[f"series_{series_id}_obj"] = series_obj
+
+    counts = bot.get_watch_counts_from_profile()
+    rt = bot.runtime_watch_counts or {}
+    total_unwatched = 0
+    for ep in episodes_sorted:
+        ep_no = ep.get("episodeNo")
+        kp = (str(series_id), str(ep_no))
+        if counts.get(kp, 0) + rt.get(kp, 0) == 0:
+            total_unwatched += 1
+
+    header = (
+        f"🎬 <b>{title}</b>\n"
+        f"Series ID: <code>{series_id}</code>\n"
+        f"Episodes: {len(episodes_sorted)}\n"
+        f"Unwatched: {total_unwatched} | Already watched (at least once): {len(episodes_sorted) - total_unwatched}\n\n"
+        f"Per ep 4x rewards: 15→8→5→3 coins\n"
+        f"Click ▶ for fresh watch | Click E{N} Nx/4 for Rewatch"
+    )
+    kb = build_episode_keyboard(series_id, episodes_sorted, bot, force_refresh=False)
+    return header, kb
+
+
+async def single_ep_watcher_runner(update_obj, context, series_id, ep_no_str, is_rewatch=False):
+    """Called from callback dispatcher for ep: and rew: actions."""
+    uid = update_obj.from_user.id
+    bot = get_bot(uid)
+    query = update_obj
+
+    if not set_busy(uid):
+        await query.answer("Task already running! Finish existing or use /stop", show_alert=True)
+        return
+    try:
+        ep_no = int(ep_no_str)
+    except Exception:
+        clear_busy(uid)
+        await query.answer("Invalid episode number", show_alert=True)
+        return
+
+    episodes_sorted = context.user_data.get(f"episodes_{series_id}")
+    series_obj = context.user_data.get(f"series_{series_id}_obj")
+
+    if not episodes_sorted or not series_obj:
+        loop = asyncio.get_running_loop()
+        if not series_obj:
+            all_s = await loop.run_in_executor(None, lambda: bot.get_all_series(page_size=500, max_pages=10))
+            series_obj = None
+            for s in all_s:
+                if (s.get("_id") or s.get("id") or s.get("series_id")) == series_id:
+                    series_obj = s
+                    break
+            if not series_obj:
+                clear_busy(uid)
+                await query.answer("Series not found", show_alert=True)
+                return
+        eps, _ = await loop.run_in_executor(None, lambda: bot.get_episodes(series_id, page=1, page_size=500))
+        episodes_sorted = sorted(
+            eps,
+            key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
+        )
+
+    target_ep = None
+    for ep in episodes_sorted:
+        if str(ep.get("episodeNo")) == str(ep_no):
+            target_ep = ep
+            break
+    if not target_ep:
+        clear_busy(uid)
+        await query.answer(f"Episode {ep_no} not found", show_alert=True)
+        return
+
+    stop_flags.pop(uid, None)
+    mode_text = "🔁 Rewatching" if is_rewatch else "▶ Watching"
+    counts = bot.get_watch_counts_from_profile()
+    rt = bot.runtime_watch_counts or {}
+    kp = (str(series_id), str(ep_no))
+    current_cnt = counts.get(kp, 0) + rt.get(kp, 0)
+    nth = current_cnt + 1
+    est_coins = REWARDS_BY_WATCH.get(nth, "?") if nth <= MAX_WATCHES_PER_EP else (15 if current_cnt == 0 else "?")
+
+    title = (series_obj.get("title") or series_obj.get("hindiTitle") or "Series") if isinstance(series_obj, dict) else "Series"
+    header = (
+        f"{mode_text} <b>{title}</b>\n"
+        f"Episode: {ep_no}  (Watch #{nth})\n"
+        f"Estimated coins: +{est_coins}\n\n"
+        f"⏳ Running..."
+    )
+    msg = await query.message.reply_text(header)
+
+    loop = asyncio.get_running_loop()
+
+    def progress(text):
+        try:
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(msg.edit_text(f"{header}\n\n{text[-600:]}"))
+            )
+        except Exception:
+            pass
+
+    progress(f"Initiating watch #{nth} for E{ep_no}...")
+
+    def sync_work():
+        ok, st = bot.watch_episode(target_ep, series_obj, allow_repeat=True, nth_watch=nth)
+        try:
+            bot.claim_reward_task(series_id=series_id)
+        except Exception:
+            pass
+        bal_b = bot.get_balance_silent()
+        bot.get_profile()
+        bal_a = bot.get_balance_silent()
+        return ok, st, bal_b, bal_a
+
+    try:
+        ok, st, bal_b, bal_a = await loop.run_in_executor(None, sync_work)
+    except Exception as e:
+        clear_busy(uid)
+        await msg.edit_text(f"❌ Error: {e}")
+        return
+
+    finally:
+        clear_busy(uid)
+
+    delta = None
+    if bal_b is not None and bal_a is not None:
+        delta = bal_a - bal_b
+
+    result_header = (
+        f"{'✅' if ok else '❌'} <b>{title}</b> E{ep_no}\n"
+        f"Watch #{nth}/{MAX_WATCHES_PER_EP}  Result: {st}\n"
+    )
+    if delta is not None:
+        result_header += f"Balance: {bal_b} → {bal_a} ({delta:+d})\n"
+
+    counts = bot.get_watch_counts_from_profile()
+    rt = bot.runtime_watch_counts or {}
+    new_cnt = counts.get(kp, 0) + rt.get(kp, 0)
+    result_header += f"New count for E{ep_no}: {new_cnt}/{MAX_WATCHES_PER_EP}"
+
+    try:
+        kb = build_episode_keyboard(series_id, episodes_sorted, bot, force_refresh=True)
+        await query.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+    await msg.edit_text(result_header)
+    send_log_sync(
+        f"<b>🎬 Single ep</b> | User <code>{uid}</code>\n"
+        f"{title} E{ep_no} #{nth} → {st} | delta {delta:+d if delta is not None else '?'}"
+    )
+
+
+async def watch_series_all_runner(query, context, series_id):
+    uid = query.from_user.id
+    bot = get_bot(uid)
+    if not set_busy(uid):
+        await query.answer("Task already running! Finish existing or use /stop", show_alert=True)
+        return
+
+    try:
+        title = None
+        cache = context.user_data.get("series_list_cache") or []
+        for sid, ttl, eps, raw in cache:
+            if sid == series_id:
+                title = ttl
+                break
+        if not title:
+            loop = asyncio.get_running_loop()
+            all_s = await loop.run_in_executor(None, lambda: bot.get_all_series(page_size=300, max_pages=5))
+            for s in all_s:
+                if (s.get("_id") or s.get("id") or s.get("series_id")) == series_id:
+                    title = s.get("title") or s.get("hindiTitle") or "Series"
+                    break
+
+        stop_flags.pop(uid, None)
+        header = f"⚡ <b>4x Watch All:</b> {title or series_id}\n\n⏳ Starting..."
+        msg = await query.message.reply_text(header)
+
+        loop = asyncio.get_running_loop()
+
+        def progress(text):
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(msg.edit_text(f"{header}\n\n{text[-800:]}"))
+                )
+            except Exception:
+                pass
+
+        result = await loop.run_in_executor(
+            None,
+            lambda: bot.watch_series_smart_repeat(
+                series_id,
+                progress_callback=progress,
+                telegram_user_id=uid,
+            ),
+        )
+
+        if "error" in result:
+            await msg.edit_text(f"❌ {result['error']}")
+            return
+
+        summary = (
+            f"🏁 <b>{result['title']}</b> done\n\n"
+            f"Total episodes: {result['episodes']}\n"
+            f"Watches performed: {result['watched']}\n"
+            f"Skipped: {result['skipped']} | Failed: {result['failed']}\n"
+        )
+        if result.get("delta") is not None:
+            summary += f"💰 {result['balance_before']} → {result['balance_after']} ({result['delta']:+d})\n"
+        if result.get("stopped"):
+            summary += "⏹ Stopped by user."
+
+        episodes_sorted = context.user_data.get(f"episodes_{series_id}")
+        if not episodes_sorted:
+            eps, _ = bot.get_episodes(series_id, page=1, page_size=500)
+            episodes_sorted = sorted(
+                eps,
+                key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
+            )
+        try:
+            kb = build_episode_keyboard(series_id, episodes_sorted, bot, force_refresh=True)
+            await query.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+
+        await msg.edit_text(summary)
+
+        send_log_sync(
+            f"<b>🎬 Series all</b> | User <code>{uid}</code>\n"
+            f"{result['title']}: {result['watched']} watches | "
+            f"delta {result['delta']:+d if result.get('delta') is not None else '?'}"
+        )
+    finally:
+        clear_busy(uid)
+
+
+async def watch_callback_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    uid = query.from_user.id
+    bot = get_bot(uid)
+
+    if data == "noop":
+        return
+
+    if data.startswith("sp:"):
+        try:
+            page = int(data.split(":")[1])
+        except Exception:
+            page = 0
+        cache = context.user_data.get("series_list_cache") or []
+        if not cache:
+            await query.edit_message_text("Cache expired. /series use karo.")
+            return
+        series_full = [raw for (_, _, _, raw) in cache]
+        kb = build_series_keyboard(series_full, page=page, per_page=20)
+        try:
+            await query.edit_message_reply_markup(reply_markup=kb)
+        except Exception as e:
+            await query.message.reply_text(f"Error: {e}")
+        return
+
+    if data == "slist":
+        cache = context.user_data.get("series_list_cache") or []
+        if not cache:
+            if not bot.access_token:
+                await query.edit_message_text("Not logged in. /login")
+                return
+            series_list = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: bot.get_all_series(page_size=200, max_pages=6)
+            )
+            context.user_data["series_list_cache"] = [(
+                s.get("_id") or s.get("id") or s.get("series_id"),
+                s.get("title") or s.get("hindiTitle") or "???",
+                int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0),
+                s,
+            ) for s in series_list if (s.get("_id") or s.get("id") or s.get("series_id"))]
+            cache = context.user_data["series_list_cache"]
+        series_full = [raw for (_, _, _, raw) in cache]
+        total_eps = sum(e for _, _, e, _ in cache)
+        header = (
+            f"🎬 Choose a Series to Watch:\n\n"
+            f"Total series: {len(cache)}\n"
+            f"Total episodes across all: {total_eps}\n\n"
+            f"Per-episode 4x rewards: 15 → 8 → 5 → 3 coins"
+        )
+        kb = build_series_keyboard(series_full, page=0, per_page=20)
+        await query.edit_message_text(header, reply_markup=kb)
+        return
+
+    if data.startswith("ser:"):
+        parts = data.split(":")
+        if len(parts) >= 2:
+            series_id = parts[1]
+        else:
+            await query.answer("Invalid", show_alert=True)
+            return
+        header, kb = await _render_series_episodes(query, context, series_id)
+        if kb is None:
+            await query.edit_message_text(header)
+        else:
+            await query.edit_message_text(header, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if data.startswith("ep:"):
+        parts = data.split(":")
+        if len(parts) >= 3:
+            series_id = parts[1]
+            ep_no = parts[2]
+        else:
+            await query.answer("Invalid", show_alert=True)
+            return
+        await single_ep_watcher_runner(query, context, series_id, ep_no, is_rewatch=False)
+        return
+
+    if data.startswith("rew:"):
+        parts = data.split(":")
+        if len(parts) >= 3:
+            series_id = parts[1]
+            ep_no = parts[2]
+        else:
+            await query.answer("Invalid", show_alert=True)
+            return
+        await single_ep_watcher_runner(query, context, series_id, ep_no, is_rewatch=True)
+        return
+
+    if data.startswith("all:"):
+        parts = data.split(":")
+        if len(parts) >= 2:
+            series_id = parts[1]
+        else:
+            await query.answer("Invalid", show_alert=True)
+            return
+        await watch_series_all_runner(query, context, series_id)
+        return
+
+    await query.answer(f"Unknown action: {data}", show_alert=True)
+
+
 async def campaign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     if not bot.access_token:
@@ -1640,6 +2233,55 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔑 Bearer Token", callback_data="login:token")],
     ]
     await update.message.reply_text("Choose login method:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def tokenlogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Direct command: /tokenlogin <access_token>"""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "`/tokenlogin YOUR_ACCESS_TOKEN_HERE`\n\n"
+            "Example:\n"
+            "`/tokenlogin eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.....`",
+            parse_mode="Markdown",
+        )
+        return
+
+    token = " ".join(context.args).strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+
+    if len(token) < 20:
+        await update.message.reply_text(
+            "❌ Token kamzor lagta hai. Full access token paste karo (JWT ya long string)."
+        )
+        return
+
+    bot = get_bot(update.effective_user.id)
+    if is_busy(update.effective_user.id):
+        await update.message.reply_text("⏳ Task running, wait...")
+        return
+
+    ok = bot.login_with_token(token)
+    if ok:
+        bot.open_app()
+        bal = bot.get_balance()
+        await update.message.reply_text(
+            f"✅ Token Login Success!\n💰 Balance: {bal}",
+            reply_markup=main_menu_keyboard(),
+        )
+        send_log_sync(
+            f"✅ Token Login (direct cmd) | User <code>{update.effective_user.id}</code> | Balance: {bal}"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Token invalid ya expired.\n\n"
+            "Check karo:\n"
+            "• Token sahi paste kiya hai?\n"
+            "• Token abhi bhi active hai?\n"
+            "• Token 'Bearer ' prefixed hai toh wo auto remove ho jata hai.\n\n"
+            "Naya try: `/tokenlogin <new_token>`"
+        )
 
 
 async def login_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1730,7 +2372,18 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏹ Stopping current task... (wait a moment)")
 
 
+async def series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias /series → choose series/episodes."""
+    await watch_series_cmd(update, context)
+
+
 async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Default /watch → choose series (NOT auto everything)."""
+    await watch_series_cmd(update, context)
+
+
+async def watchall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Old auto-mode — watch EVERYTHING across all series 4x smart."""
     uid = update.effective_user.id
     bot = get_bot(uid)
     if not bot.access_token:
@@ -1745,7 +2398,7 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         stop_flags.pop(uid, None)
-        msg = await update.message.reply_text("🚀 Starting smart 4x watch...\nThoda time lagega.")
+        msg = await update.message.reply_text("🚀 Starting full-auto 4x watch...\nYe sab series pe chalaega, time lagega.")
 
         loop = asyncio.get_running_loop()
 
@@ -1753,7 +2406,7 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 loop.call_soon_threadsafe(
                     lambda: asyncio.create_task(
-                        msg.edit_text(f"🚀 Watching...\n\n{text[-900:]}")
+                        msg.edit_text(f"🚀 Full-Auto Watching...\n\n{text[-900:]}")
                     )
                 )
             except Exception:
@@ -1773,7 +2426,7 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         text = (
-            f"🏁 Watch finished\n\n"
+            f"🏁 Full-Auto Watch finished\n\n"
             f"Watched: {result['watched']}\n"
             f"Skipped: {result['skipped']}\n"
             f"Failed: {result['failed']}\n"
@@ -1909,7 +2562,20 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await accounts_cmd(update, context)
     elif text == "➕ login" or text == "login":
         await login_start(update, context)
-    elif text == "🎬 watch all (4x)" or text == "watch all (4x)" or text == "watch":
+    elif text == "🔑 token login" or text == "token login":
+        await update.message.reply_text(
+            "🔑 Token Login:\n\n"
+            "Command use karo:\n"
+            "`/tokenlogin YOUR_FULL_ACCESS_TOKEN`\n\n"
+            "Example:\n"
+            "`/tokenlogin eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2Vy...`",
+            parse_mode="Markdown",
+        )
+    elif text == "🎬 watch series" or text == "watch series":
+        await watch_series_cmd(update, context)
+    elif text == "🎬 watch all (4x)" or text == "watch all (4x)":
+        await watchall_cmd(update, context)
+    elif text == "watch":
         await watch_cmd(update, context)
     elif text == "🧠 quiz status" or text == "quiz status":
         await quiz_status_cmd(update, context)
@@ -1967,13 +2633,17 @@ def main():
     app.add_handler(CommandHandler("campaign", campaign_cmd))
     app.add_handler(CommandHandler("accounts", accounts_cmd))
     app.add_handler(CommandHandler("login", login_start))
+    app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd))
+    app.add_handler(CommandHandler("series", series_cmd))
     app.add_handler(CommandHandler("watch", watch_cmd))
+    app.add_handler(CommandHandler("watchall", watchall_cmd))
     app.add_handler(CommandHandler("quiz", quiz_status_cmd))
     app.add_handler(CommandHandler("setgroq", set_groq))
     app.add_handler(CommandHandler("mygroq", my_groq))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(sw|rm):"))
+    app.add_handler(CallbackQueryHandler(watch_callback_dispatcher, pattern=r"^(ser:|ep:|rew:|all:|sp:|slist$|noop$)"))
     app.add_handler(login_conv)
     app.add_handler(quiz_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
