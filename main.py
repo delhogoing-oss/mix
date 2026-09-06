@@ -214,6 +214,26 @@ def get_user_groq_keys(user_id: int) -> List[str]:
 stop_flags: Dict[int, bool] = {}
 
 
+def interruptible_sleep(total_seconds: float, telegram_user_id=None, tick: float = 0.3) -> bool:
+    """Sleep in small ticks; return True if stop_flag triggered (stopped), False otherwise."""
+    uid_key = None
+    if telegram_user_id is not None:
+        try:
+            uid_key = int(telegram_user_id)
+        except Exception:
+            uid_key = None
+    if total_seconds <= 0:
+        return bool(stop_flags.get(uid_key, False)) if uid_key is not None else False
+    remaining = float(total_seconds)
+    while remaining > 0:
+        chunk = min(tick, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+        if uid_key is not None and stop_flags.get(uid_key, False):
+            return True
+    return False
+
+
 # ───────────────────── MiniPix Core (per-TG-user accounts) ─────────────────────
 def _load_all_accounts_file() -> dict:
     """Load entire accounts file (outer key = telegram user id). Thread-unsafe, caller must lock."""
@@ -1395,7 +1415,12 @@ class MiniPixV2:
                         break
                     if attempt == 0:
                         log("⚠️ Session start failed, retrying in 3s...")
-                        time.sleep(3)
+                        if interruptible_sleep(3, telegram_user_id=telegram_user_id):
+                            log("⏹ Stopped by user.")
+                            stopped = True
+                            break
+                if stopped:
+                    break
 
                 if not session_id or not question_obj:
                     log("❌ Failed to start session after retry")
@@ -1404,7 +1429,10 @@ class MiniPixV2:
                     if failed_attempts >= 2:
                         log("Aborting: too many failed attempts to start session.")
                         break
-                    time.sleep(3)
+                    if interruptible_sleep(3, telegram_user_id=telegram_user_id):
+                        log("⏹ Stopped by user.")
+                        stopped = True
+                        break
                     continue
 
                 hearts = session_meta.get("hearts", 3) if session_meta else 3
@@ -1415,7 +1443,10 @@ class MiniPixV2:
                     if failed_attempts >= 2:
                         log("Aborting: repeated dead sessions.")
                         break
-                    time.sleep(5)
+                    if interruptible_sleep(5, telegram_user_id=telegram_user_id):
+                        log("⏹ Stopped by user.")
+                        stopped = True
+                        break
                     continue
 
                 failed_attempts = 0
@@ -1467,7 +1498,10 @@ class MiniPixV2:
                     correct_index = max(0, min(correct_index, len(options) - 1))
                     chosen_text = options[correct_index]
 
-                    time.sleep(question_delay)
+                    if interruptible_sleep(question_delay, telegram_user_id=telegram_user_id):
+                        log("⏹ Stopped by user.")
+                        stopped = True
+                        break
 
                     result = self.quiz_submit_answer(session_id, q_id, correct_index)
                     if not result:
@@ -1545,7 +1579,10 @@ class MiniPixV2:
 
                 sessions_done += 1
                 if session_num < max_sessions:
-                    time.sleep(2)
+                    if interruptible_sleep(2, telegram_user_id=telegram_user_id):
+                        log("⏹ Stopped by user.")
+                        stopped = True
+                        break
         finally:
             stop_flags.pop(telegram_user_id, None)
 
@@ -2520,14 +2557,19 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     stop_flags[user_id] = True
     was_busy = is_busy(user_id)
+    clear_busy(user_id)
     if was_busy:
-        clear_busy(user_id)
         await update.message.reply_text(
-            "⏹ Stopping current task & resetting busy flag... (wait a moment)\n"
-            "Agar ab bhi stuck lage to 2-3 sec baad dobara try karo."
+            "⏹ Stop signal bheja + busy flag reset kar diya.\n"
+            "Active thread ab 1-2 sec mein stop ho jayega (sleep intervals ke baad).\n"
+            "Agar ab bhi stuck lage to 2-3 sec baad ek baar aur /stop bhejo.",
+            reply_markup=main_menu_keyboard(),
         )
     else:
-        await update.message.reply_text("⏹ Stop signal bheja (koi active task nahi tha).")
+        await update.message.reply_text(
+            "⏹ Stop signal set kar diya.\nKoi active task nahi tha.",
+            reply_markup=main_menu_keyboard(),
+        )
 
 
 async def series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2669,22 +2711,22 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    await update.message.reply_text("Kitne quiz sessions? (10-25, default 15):")
+    await update.message.reply_text("Kitne quiz sessions? (1-25, default 1):")
     return WAIT_QUIZ_SESSIONS
 
 
 async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        n = int(update.message.text.strip() or "15")
-        n = max(10, min(25, n))
+        n = int(update.message.text.strip() or "1")
+        n = max(1, min(25, n))
     except Exception:
-        n = 15
+        n = 1
     context.user_data["quiz_sessions"] = n
 
     uid = update.effective_user.id
     chat_id = update.effective_chat.id if update.effective_chat else uid
     bot = get_bot(uid)
-    sessions = context.user_data.get("quiz_sessions", 15)
+    sessions = context.user_data.get("quiz_sessions", 1)
 
     if not set_busy(uid):
         await update.message.reply_text(
@@ -2825,7 +2867,6 @@ def main():
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .concurrent_updates(True)
-        .executor(BLOCKING_EXECUTOR)
         .build()
     )
 
