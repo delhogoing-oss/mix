@@ -26,6 +26,7 @@ Bug fixes
 *  Infinite `while any_progress` loop ke liye safety cap.
 *  QUIZ SOLVING: error handling improved, session/claim failures now set state,
    model default changed to openai/gpt-oss-120b (override with GROQ_MODEL).
+*  STARTUP FIX: config = BotConfig() instead of BotConfig.load() (TypeError).
 """
 
 import asyncio
@@ -3274,7 +3275,8 @@ def main():
         print("    pip install 'python-telegram-bot[rate-limiter]==21.*' requests flask")
         sys.exit(1)
 
-    config = BotConfig.load()
+    # FIXED: use BotConfig() instead of BotConfig.load()
+    config = BotConfig()
     token = config.bot_token
     if not token:
         print("[X] BOT_TOKEN nahi mila. Environment variable set karo ya bot_config.json banao.")
