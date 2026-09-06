@@ -25,6 +25,8 @@ import logging
 import asyncio
 import atexit
 import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Dict, Optional, List
 
@@ -87,6 +89,12 @@ _accounts_file_lock = threading.Lock()
 _groq_file_lock = threading.Lock()
 user_busy: Dict[int, bool] = {}
 _busy_lock = threading.Lock()
+
+BLOCKING_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(64, (os.cpu_count() or 4) * 16),
+    thread_name_prefix="minipix-worker",
+)
+atexit.register(lambda: BLOCKING_EXECUTOR.shutdown(wait=False))
 
 
 def set_busy(user_id: int) -> bool:
@@ -1658,6 +1666,50 @@ def build_episode_keyboard(series_id, episodes, mp_instance: MiniPixV2, force_re
     return InlineKeyboardMarkup(rows)
 
 
+# ───────────────────── Global Error Handler ─────────────────────
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    tb_str = "".join(traceback.format_exception(None, err, err.__traceback__)) if err else ""
+    logger.error(f"Exception while handling update:\n{tb_str}")
+    send_log_sync(f"❌ <b>Bot Error</b>\n<pre>{tb_str[:1200]}</pre>")
+
+    uid = None
+    chat_id = None
+    effective_message = None
+    if isinstance(update, Update):
+        if update.effective_user:
+            uid = update.effective_user.id
+        if update.effective_chat:
+            chat_id = update.effective_chat.id
+        if update.effective_message:
+            effective_message = update.effective_message
+        elif update.callback_query and update.callback_query.message:
+            effective_message = update.callback_query.message
+
+    if uid is not None and is_busy(uid):
+        clear_busy(uid)
+
+    if chat_id is not None:
+        user_hint = (
+            "\n\n🔧 Troubleshoot:\n"
+            "• Agar task stuck lage → /stop use karo\n"
+            "• Dobara same button click karo ya command bhejo\n"
+            "• Agar baar baar aaye → bot restart karo ya developer ko message bhejo."
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ <b>Bot mein error aa gaya:</b>\n"
+                    f"<code>{(str(err)[:300] if err else 'Unknown')}</code>"
+                    f"{user_hint}"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
 # ───────────────────── Handlers ─────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1771,7 +1823,9 @@ async def watch_series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("🔍 Series list fetch ho raha hai...")
     loop = asyncio.get_running_loop()
-    series_list = await loop.run_in_executor(None, lambda: bot.get_all_series(page_size=200, max_pages=6))
+    series_list = await loop.run_in_executor(
+        BLOCKING_EXECUTOR, lambda: bot.get_all_series(page_size=200, max_pages=6)
+    )
     if not series_list:
         await msg.edit_text("❌ Koi series nahi mili.")
         return
@@ -1815,7 +1869,9 @@ async def _render_series_episodes(query, context, series_id, msg_to_edit=None):
             break
 
     loop = asyncio.get_running_loop()
-    episodes, _ = await loop.run_in_executor(None, lambda: bot.get_episodes(series_id, page=1, page_size=500))
+    episodes, _ = await loop.run_in_executor(
+        BLOCKING_EXECUTOR, lambda: bot.get_episodes(series_id, page=1, page_size=500)
+    )
     if not episodes:
         return "❌ Is series mein koi episode nahi mili.", None
 
@@ -1828,7 +1884,9 @@ async def _render_series_episodes(query, context, series_id, msg_to_edit=None):
     context.user_data[f"episodes_{series_id}"] = episodes_sorted
 
     if not series_obj:
-        for s in await loop.run_in_executor(None, lambda: bot.get_all_series(page_size=500, max_pages=10)):
+        for s in await loop.run_in_executor(
+            BLOCKING_EXECUTOR, lambda: bot.get_all_series(page_size=500, max_pages=10)
+        ):
             if (s.get("_id") or s.get("id")) == series_id:
                 series_obj = s
                 break
@@ -1861,136 +1919,182 @@ async def single_ep_watcher_runner(update_obj, context, series_id, ep_no_str, is
     uid = update_obj.from_user.id
     bot = get_bot(uid)
     query = update_obj
+    chat_id = getattr(query.message, "chat_id", None) if getattr(query, "message", None) else uid
 
     if not set_busy(uid):
         await query.answer("Task already running! Finish existing or use /stop", show_alert=True)
         return
+
+    msg = None
+    episodes_sorted = None
     try:
-        ep_no = int(ep_no_str)
-    except Exception:
-        clear_busy(uid)
-        await query.answer("Invalid episode number", show_alert=True)
-        return
+        try:
+            ep_no = int(ep_no_str)
+        except Exception:
+            await query.answer("Invalid episode number", show_alert=True)
+            return
 
-    episodes_sorted = context.user_data.get(f"episodes_{series_id}")
-    series_obj = context.user_data.get(f"series_{series_id}_obj")
-
-    if not episodes_sorted or not series_obj:
         loop = asyncio.get_running_loop()
-        if not series_obj:
-            all_s = await loop.run_in_executor(None, lambda: bot.get_all_series(page_size=500, max_pages=10))
-            series_obj = None
-            for s in all_s:
-                if (s.get("_id") or s.get("id") or s.get("series_id")) == series_id:
-                    series_obj = s
-                    break
+
+        episodes_sorted = context.user_data.get(f"episodes_{series_id}")
+        series_obj = context.user_data.get(f"series_{series_id}_obj")
+
+        if not episodes_sorted or not series_obj:
             if not series_obj:
-                clear_busy(uid)
-                await query.answer("Series not found", show_alert=True)
-                return
-        eps, _ = await loop.run_in_executor(None, lambda: bot.get_episodes(series_id, page=1, page_size=500))
-        episodes_sorted = sorted(
-            eps,
-            key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
+                all_s = await loop.run_in_executor(
+                    BLOCKING_EXECUTOR, lambda: bot.get_all_series(page_size=500, max_pages=10)
+                )
+                for s in all_s:
+                    if (s.get("_id") or s.get("id") or s.get("series_id")) == series_id:
+                        series_obj = s
+                        break
+                if not series_obj:
+                    await query.answer("Series not found", show_alert=True)
+                    return
+            eps, _ = await loop.run_in_executor(
+                BLOCKING_EXECUTOR, lambda: bot.get_episodes(series_id, page=1, page_size=500)
+            )
+            episodes_sorted = sorted(
+                eps,
+                key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
+            )
+            context.user_data[f"episodes_{series_id}"] = episodes_sorted
+            context.user_data[f"series_{series_id}_obj"] = series_obj
+
+        target_ep = None
+        for ep in episodes_sorted:
+            if str(ep.get("episodeNo")) == str(ep_no):
+                target_ep = ep
+                break
+        if not target_ep:
+            await query.answer(f"Episode {ep_no} not found", show_alert=True)
+            return
+
+        stop_flags.pop(uid, None)
+        mode_text = "🔁 Rewatching" if is_rewatch else "▶ Watching"
+        counts = bot.get_watch_counts_from_profile()
+        rt = bot.runtime_watch_counts or {}
+        kp = (str(series_id), str(ep_no))
+        current_cnt = counts.get(kp, 0) + rt.get(kp, 0)
+        nth = current_cnt + 1
+        est_coins = REWARDS_BY_WATCH.get(nth, "?") if nth <= MAX_WATCHES_PER_EP else (15 if current_cnt == 0 else "?")
+
+        title = (
+            (series_obj.get("title") or series_obj.get("hindiTitle") or "Series")
+            if isinstance(series_obj, dict) else "Series"
+        )
+        header = (
+            f"{mode_text} <b>{title}</b>\n"
+            f"Episode: {ep_no}  (Watch #{nth})\n"
+            f"Estimated coins: +{est_coins}\n\n"
+            f"⏳ Running..."
         )
 
-    target_ep = None
-    for ep in episodes_sorted:
-        if str(ep.get("episodeNo")) == str(ep_no):
-            target_ep = ep
-            break
-    if not target_ep:
-        clear_busy(uid)
-        await query.answer(f"Episode {ep_no} not found", show_alert=True)
-        return
-
-    stop_flags.pop(uid, None)
-    mode_text = "🔁 Rewatching" if is_rewatch else "▶ Watching"
-    counts = bot.get_watch_counts_from_profile()
-    rt = bot.runtime_watch_counts or {}
-    kp = (str(series_id), str(ep_no))
-    current_cnt = counts.get(kp, 0) + rt.get(kp, 0)
-    nth = current_cnt + 1
-    est_coins = REWARDS_BY_WATCH.get(nth, "?") if nth <= MAX_WATCHES_PER_EP else (15 if current_cnt == 0 else "?")
-
-    title = (series_obj.get("title") or series_obj.get("hindiTitle") or "Series") if isinstance(series_obj, dict) else "Series"
-    header = (
-        f"{mode_text} <b>{title}</b>\n"
-        f"Episode: {ep_no}  (Watch #{nth})\n"
-        f"Estimated coins: +{est_coins}\n\n"
-        f"⏳ Running..."
-    )
-    msg = await query.message.reply_text(header)
-
-    loop = asyncio.get_running_loop()
-
-    def progress(text):
         try:
-            loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(msg.edit_text(f"{header}\n\n{text[-600:]}"))
-            )
+            if query.message is not None:
+                msg = await query.message.reply_text(header)
+            else:
+                msg = await context.bot.send_message(chat_id=chat_id, text=header)
+        except Exception as send_err:
+            try:
+                await query.answer(f"Msg send failed: {str(send_err)[:60]}", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        async def async_progress(text):
+            try:
+                await msg.edit_text(f"{header}\n\n{text[-600:]}")
+            except Exception:
+                pass
+
+        def progress(text):
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(async_progress(text))
+                )
+            except Exception:
+                pass
+
+        progress(f"Initiating watch #{nth} for E{ep_no}...")
+
+        def sync_work():
+            ok, st = bot.watch_episode(target_ep, series_obj, allow_repeat=True, nth_watch=nth)
+            try:
+                bot.claim_reward_task(series_id=series_id)
+            except Exception:
+                pass
+            bal_b = bot.get_balance_silent()
+            try:
+                bot.get_profile()
+            except Exception:
+                pass
+            bal_a = bot.get_balance_silent()
+            return ok, st, bal_b, bal_a
+
+        ok, st, bal_b, bal_a = await loop.run_in_executor(BLOCKING_EXECUTOR, sync_work)
+
+        delta = None
+        if bal_b is not None and bal_a is not None:
+            delta = bal_a - bal_b
+
+        result_header = (
+            f"{'✅' if ok else '❌'} <b>{title}</b> E{ep_no}\n"
+            f"Watch #{nth}/{MAX_WATCHES_PER_EP}  Result: {st}\n"
+        )
+        if delta is not None:
+            result_header += f"Balance: {bal_b} → {bal_a} ({delta:+d})\n"
+
+        counts = bot.get_watch_counts_from_profile()
+        rt = bot.runtime_watch_counts or {}
+        new_cnt = counts.get(kp, 0) + rt.get(kp, 0)
+        result_header += f"New count for E{ep_no}: {new_cnt}/{MAX_WATCHES_PER_EP}"
+
+        if query.message is not None and episodes_sorted:
+            try:
+                kb = build_episode_keyboard(series_id, episodes_sorted, bot, force_refresh=True)
+                await query.message.edit_reply_markup(reply_markup=kb)
+            except Exception:
+                pass
+
+        try:
+            await msg.edit_text(result_header)
+        except Exception as edit_err:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=result_header)
+            except Exception:
+                pass
+
+        send_log_sync(
+            f"<b>🎬 Single ep</b> | User <code>{uid}</code>\n"
+            f"{title} E{ep_no} #{nth} → {st} | delta {delta:+d if delta is not None else '?'}"
+        )
+
+    except Exception as top_err:
+        err_text = f"❌ Unexpected error: {str(top_err)[:200]}"
+        try:
+            if msg is not None:
+                await msg.edit_text(err_text)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=err_text)
         except Exception:
             pass
-
-    progress(f"Initiating watch #{nth} for E{ep_no}...")
-
-    def sync_work():
-        ok, st = bot.watch_episode(target_ep, series_obj, allow_repeat=True, nth_watch=nth)
-        try:
-            bot.claim_reward_task(series_id=series_id)
-        except Exception:
-            pass
-        bal_b = bot.get_balance_silent()
-        bot.get_profile()
-        bal_a = bot.get_balance_silent()
-        return ok, st, bal_b, bal_a
-
-    try:
-        ok, st, bal_b, bal_a = await loop.run_in_executor(None, sync_work)
-    except Exception as e:
-        clear_busy(uid)
-        await msg.edit_text(f"❌ Error: {e}")
-        return
+        logger.error(f"single_ep_watcher_runner crash user={uid}: {top_err}\n{traceback.format_exc()}")
 
     finally:
         clear_busy(uid)
-
-    delta = None
-    if bal_b is not None and bal_a is not None:
-        delta = bal_a - bal_b
-
-    result_header = (
-        f"{'✅' if ok else '❌'} <b>{title}</b> E{ep_no}\n"
-        f"Watch #{nth}/{MAX_WATCHES_PER_EP}  Result: {st}\n"
-    )
-    if delta is not None:
-        result_header += f"Balance: {bal_b} → {bal_a} ({delta:+d})\n"
-
-    counts = bot.get_watch_counts_from_profile()
-    rt = bot.runtime_watch_counts or {}
-    new_cnt = counts.get(kp, 0) + rt.get(kp, 0)
-    result_header += f"New count for E{ep_no}: {new_cnt}/{MAX_WATCHES_PER_EP}"
-
-    try:
-        kb = build_episode_keyboard(series_id, episodes_sorted, bot, force_refresh=True)
-        await query.message.edit_reply_markup(reply_markup=kb)
-    except Exception:
-        pass
-
-    await msg.edit_text(result_header)
-    send_log_sync(
-        f"<b>🎬 Single ep</b> | User <code>{uid}</code>\n"
-        f"{title} E{ep_no} #{nth} → {st} | delta {delta:+d if delta is not None else '?'}"
-    )
 
 
 async def watch_series_all_runner(query, context, series_id):
     uid = query.from_user.id
     bot = get_bot(uid)
+    chat_id = getattr(query.message, "chat_id", None) if getattr(query, "message", None) else uid
+
     if not set_busy(uid):
         await query.answer("Task already running! Finish existing or use /stop", show_alert=True)
         return
 
+    msg = None
     try:
         title = None
         cache = context.user_data.get("series_list_cache") or []
@@ -2000,7 +2104,9 @@ async def watch_series_all_runner(query, context, series_id):
                 break
         if not title:
             loop = asyncio.get_running_loop()
-            all_s = await loop.run_in_executor(None, lambda: bot.get_all_series(page_size=300, max_pages=5))
+            all_s = await loop.run_in_executor(
+                BLOCKING_EXECUTOR, lambda: bot.get_all_series(page_size=300, max_pages=5)
+            )
             for s in all_s:
                 if (s.get("_id") or s.get("id") or s.get("series_id")) == series_id:
                     title = s.get("title") or s.get("hindiTitle") or "Series"
@@ -2008,20 +2114,37 @@ async def watch_series_all_runner(query, context, series_id):
 
         stop_flags.pop(uid, None)
         header = f"⚡ <b>4x Watch All:</b> {title or series_id}\n\n⏳ Starting..."
-        msg = await query.message.reply_text(header)
+
+        try:
+            if query.message is not None:
+                msg = await query.message.reply_text(header)
+            else:
+                msg = await context.bot.send_message(chat_id=chat_id, text=header)
+        except Exception as send_err:
+            try:
+                await query.answer(f"Msg send failed: {str(send_err)[:60]}", show_alert=True)
+            except Exception:
+                pass
+            return
 
         loop = asyncio.get_running_loop()
+
+        async def async_progress(text):
+            try:
+                await msg.edit_text(f"{header}\n\n{text[-800:]}")
+            except Exception:
+                pass
 
         def progress(text):
             try:
                 loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(msg.edit_text(f"{header}\n\n{text[-800:]}"))
+                    lambda: asyncio.create_task(async_progress(text))
                 )
             except Exception:
                 pass
 
         result = await loop.run_in_executor(
-            None,
+            BLOCKING_EXECUTOR,
             lambda: bot.watch_series_smart_repeat(
                 series_id,
                 progress_callback=progress,
@@ -2030,7 +2153,13 @@ async def watch_series_all_runner(query, context, series_id):
         )
 
         if "error" in result:
-            await msg.edit_text(f"❌ {result['error']}")
+            try:
+                await msg.edit_text(f"❌ {result['error']}")
+            except Exception:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=f"❌ {result['error']}")
+                except Exception:
+                    pass
             return
 
         summary = (
@@ -2046,24 +2175,45 @@ async def watch_series_all_runner(query, context, series_id):
 
         episodes_sorted = context.user_data.get(f"episodes_{series_id}")
         if not episodes_sorted:
-            eps, _ = bot.get_episodes(series_id, page=1, page_size=500)
+            eps, _ = await loop.run_in_executor(
+                BLOCKING_EXECUTOR, lambda: bot.get_episodes(series_id, page=1, page_size=500)
+            )
             episodes_sorted = sorted(
                 eps,
                 key=lambda e: int(e.get("episodeNo") or 0) if str(e.get("episodeNo") or "").isdigit() else 0,
             )
-        try:
-            kb = build_episode_keyboard(series_id, episodes_sorted, bot, force_refresh=True)
-            await query.message.edit_reply_markup(reply_markup=kb)
-        except Exception:
-            pass
+        if query.message is not None and episodes_sorted:
+            try:
+                kb = build_episode_keyboard(series_id, episodes_sorted, bot, force_refresh=True)
+                await query.message.edit_reply_markup(reply_markup=kb)
+            except Exception:
+                pass
 
-        await msg.edit_text(summary)
+        try:
+            await msg.edit_text(summary)
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=summary)
+            except Exception:
+                pass
 
         send_log_sync(
             f"<b>🎬 Series all</b> | User <code>{uid}</code>\n"
             f"{result['title']}: {result['watched']} watches | "
             f"delta {result['delta']:+d if result.get('delta') is not None else '?'}"
         )
+
+    except Exception as top_err:
+        err_text = f"❌ Unexpected error: {str(top_err)[:200]}"
+        try:
+            if msg is not None:
+                await msg.edit_text(err_text)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=err_text)
+        except Exception:
+            pass
+        logger.error(f"watch_series_all_runner crash user={uid}: {top_err}\n{traceback.format_exc()}")
+
     finally:
         clear_busy(uid)
 
@@ -2102,7 +2252,7 @@ async def watch_callback_dispatcher(update: Update, context: ContextTypes.DEFAUL
                 await query.edit_message_text("Not logged in. /login")
                 return
             series_list = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: bot.get_all_series(page_size=200, max_pages=6)
+                BLOCKING_EXECUTOR, lambda: bot.get_all_series(page_size=200, max_pages=6)
             )
             context.user_data["series_list_cache"] = [(
                 s.get("_id") or s.get("id") or s.get("series_id"),
@@ -2369,7 +2519,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     stop_flags[user_id] = True
-    await update.message.reply_text("⏹ Stopping current task... (wait a moment)")
+    was_busy = is_busy(user_id)
+    if was_busy:
+        clear_busy(user_id)
+        await update.message.reply_text(
+            "⏹ Stopping current task & resetting busy flag... (wait a moment)\n"
+            "Agar ab bhi stuck lage to 2-3 sec baad dobara try karo."
+        )
+    else:
+        await update.message.reply_text("⏹ Stop signal bheja (koi active task nahi tha).")
 
 
 async def series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2385,6 +2543,7 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def watchall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Old auto-mode — watch EVERYTHING across all series 4x smart."""
     uid = update.effective_user.id
+    chat_id = update.effective_chat.id if update.effective_chat else uid
     bot = get_bot(uid)
     if not bot.access_token:
         await update.message.reply_text("Not logged in. Use /login")
@@ -2396,24 +2555,29 @@ async def watchall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    msg = None
     try:
         stop_flags.pop(uid, None)
         msg = await update.message.reply_text("🚀 Starting full-auto 4x watch...\nYe sab series pe chalaega, time lagega.")
 
         loop = asyncio.get_running_loop()
 
+        async def async_progress(text):
+            try:
+                await msg.edit_text(f"🚀 Full-Auto Watching...\n\n{text[-900:]}")
+            except Exception:
+                pass
+
         def progress(text):
             try:
                 loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(
-                        msg.edit_text(f"🚀 Full-Auto Watching...\n\n{text[-900:]}")
-                    )
+                    lambda: asyncio.create_task(async_progress(text))
                 )
             except Exception:
                 pass
 
         result = await loop.run_in_executor(
-            None,
+            BLOCKING_EXECUTOR,
             lambda: bot.browse_and_watch_all_smart_repeat(
                 progress_callback=progress,
                 max_watches=250,
@@ -2422,7 +2586,13 @@ async def watchall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if "error" in result:
-            await msg.edit_text(f"❌ {result['error']}")
+            try:
+                await msg.edit_text(f"❌ {result['error']}")
+            except Exception:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=f"❌ {result['error']}")
+                except Exception:
+                    pass
             return
 
         text = (
@@ -2435,7 +2605,25 @@ async def watchall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"💰 {result['balance_before']} → {result['balance_after']} ({result['delta']:+d})"
         if result.get("stopped"):
             text += "\n⏹ Stopped by user."
-        await msg.edit_text(text)
+        try:
+            await msg.edit_text(text)
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            except Exception:
+                pass
+
+    except Exception as top_err:
+        err_text = f"❌ Unexpected error: {str(top_err)[:200]}"
+        try:
+            if msg is not None:
+                await msg.edit_text(err_text)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=err_text)
+        except Exception:
+            pass
+        logger.error(f"watchall_cmd crash user={uid}: {top_err}\n{traceback.format_exc()}")
+
     finally:
         clear_busy(uid)
 
@@ -2494,6 +2682,7 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["quiz_sessions"] = n
 
     uid = update.effective_user.id
+    chat_id = update.effective_chat.id if update.effective_chat else uid
     bot = get_bot(uid)
     sessions = context.user_data.get("quiz_sessions", 15)
 
@@ -2503,24 +2692,29 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    msg = None
     try:
         stop_flags.pop(uid, None)
         msg = await update.message.reply_text(f"🤖 Running {sessions} sessions (delay 10s)...")
 
         loop = asyncio.get_running_loop()
 
+        async def async_progress(text):
+            try:
+                await msg.edit_text(f"🤖 Quiz running...\n\n{text[-900:]}")
+            except Exception:
+                pass
+
         def progress(text):
             try:
                 loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(
-                        msg.edit_text(f"🤖 Quiz running...\n\n{text[-900:]}")
-                    )
+                    lambda: asyncio.create_task(async_progress(text))
                 )
             except Exception:
                 pass
 
         result = await loop.run_in_executor(
-            None,
+            BLOCKING_EXECUTOR,
             lambda: bot.run_quiz_auto(
                 max_sessions=sessions,
                 question_delay=QUIZ_QUESTION_DELAY,
@@ -2530,7 +2724,13 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if "error" in result:
-            await msg.edit_text(f"❌ {result['error']}")
+            try:
+                await msg.edit_text(f"❌ {result['error']}")
+            except Exception:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=f"❌ {result['error']}")
+                except Exception:
+                    pass
         else:
             text = (
                 f"🏁 Quiz done\n"
@@ -2540,8 +2740,27 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if result.get("stopped"):
                 text += "\n⏹ Stopped by user."
-            await msg.edit_text(text)
+            try:
+                await msg.edit_text(text)
+            except Exception:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=text)
+                except Exception:
+                    pass
         return ConversationHandler.END
+
+    except Exception as top_err:
+        err_text = f"❌ Unexpected error: {str(top_err)[:200]}"
+        try:
+            if msg is not None:
+                await msg.edit_text(err_text)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=err_text)
+        except Exception:
+            pass
+        logger.error(f"quiz_sessions crash user={uid}: {top_err}\n{traceback.format_exc()}")
+        return ConversationHandler.END
+
     finally:
         clear_busy(uid)
 
@@ -2602,7 +2821,15 @@ def main():
         print("ERROR: Set TELEGRAM_BOT_TOKEN")
         return
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .concurrent_updates(True)
+        .executor(BLOCKING_EXECUTOR)
+        .build()
+    )
+
+    app.add_error_handler(global_error_handler)
 
     login_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],
