@@ -1885,7 +1885,7 @@ async def watch_series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(header, reply_markup=kb)
 
 
-async def _get_series_obj(series_id, series_cache):
+def _get_series_obj(series_id, series_cache):
     for sid, title, eps, raw in (series_cache or []):
         if sid == series_id:
             return raw
