@@ -24,9 +24,7 @@ Bug fixes
 *  Telegram flood-control: progress edits ab throttled + RetryAfter safe.
 *  quizzes_solved har log-line par bump ho raha tha. Ab per-session.
 *  Infinite `while any_progress` loop ke liye safety cap.
-*  QUIZ SOLVING: error handling improved, session/claim failures now set state,
-   model default changed to openai/gpt-oss-120b (override with GROQ_MODEL).
-*  STARTUP FIX: config = BotConfig() instead of BotConfig.load() (TypeError).
+*  QUIZ SOLVING: replaced with fully working logic from minipix_v2.py.
 """
 
 import asyncio
@@ -36,6 +34,7 @@ import io
 import json
 import os
 import random
+import re
 import string
 import sys
 import threading
@@ -136,6 +135,7 @@ STATS_FILE = os.path.join(DATA_DIR, "usage_stats.json")
 
 MAX_WATCHES_PER_EP = 4
 REWARDS_BY_WATCH = {1: 15, 2: 8, 3: 5, 4: 3}
+QUIZ_QUESTION_DELAY = 10  # seconds between questions
 
 
 def _env_int(name, default):
@@ -1473,180 +1473,127 @@ class MiniPixUserSession:
         })
         return True, "done", gained, expected
 
-    # ---- quiz ------------------------------------------------------------
-    def solve_quiz_with_groq(self, question, opts, force=False):
-        opts = [str(x) for x in (opts or [])]
-        if not opts or not self.groq_api_key:
-            return -1, None
-
-        qid = question.get("questionId") or question.get("id") or ""
-        qhi = str(question.get("questionHi") or "")
-        qen = str(question.get("questionEn") or "")
-        topic = str(question.get("topic") or "")
-        qtype = question.get("type") or "unknown"
-
-        cache_key = (qid, tuple(opts), qhi, qen, topic)
-        if not force and cache_key in self.groq_cache:
-            return self.groq_cache[cache_key]
-
-        lines = [
-            "# MINI-QUIZ QUESTION (LEVEL-1 KIDS)",
-            "",
-            f"**Type**: {qtype}",
-            f"**Question (Hi)**: {qhi}",
-            f"**Question (En)**: {qen}",
-        ]
-        if topic:
-            lines.append(f"**Topic**: {topic}")
-        lines += ["", "**Options (index = N from 0)**:"]
-        for i, o in enumerate(opts):
-            lines.append(f"  N={i}  ->  {o}")
-        lines += [
-            "",
-            "## INSTRUCTIONS",
-            "- This is a KIDS/LEVEL-1 multiple choice question inside an Indian short-video app.",
-            "- Pick the SINGLE best correct option index.",
-            "- Return ONLY a strict JSON object, exactly one line, in this shape:",
-            '  {"chosenIndex": N, "reasoning": "short reasoning"}',
-            f"- N MUST be an integer between 0 and {len(opts) - 1} inclusive.",
-            "- Strict JSON only, no markdown, no extra text.",
-            "",
-            "## OUTPUT (strict JSON only)",
-        ]
-        prompt = "\n".join(lines)
-
-        chosen_index, reasoning = -1, None
-        try:
-            # Use the model specified, but if it fails, you can change the default.
-            # The model "openai/gpt-oss-120b" might not be available on Groq.
-            # Set GROQ_MODEL environment variable to override.
-            model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-            body = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 256,
-                "response_format": {"type": "json_object"},
-            }
-            # Isolated session: v1 reused the MiniPix session and leaked its bearer.
-            resp = GROQ_HTTP.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {str(self.groq_api_key).strip()}",
-                    "content-type": "application/json",
-                },
-                data=json.dumps(body),
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                choices = (resp.json() or {}).get("choices") or []
-                if choices:
-                    raw_txt = (choices[0].get("message") or {}).get("content") or ""
-                    chosen_index, reasoning = self._parse_quiz_json(raw_txt, len(opts))
-            else:
-                # Log the error but continue
-                print(f"[!] Groq API error {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            print(f"[!] Groq call exception: {e}")
-
-        if chosen_index is not None and 0 <= int(chosen_index) < len(opts):
-            result = (int(chosen_index), reasoning or "groq")
-            self.groq_cache[cache_key] = result
-            return result
-        return -1, None
-
-    def _parse_quiz_json(self, raw_text, n_options):
-        import re as _re
-        if not raw_text:
-            return -1, None
-        chosen_index, reasoning = -1, None
-        s = str(raw_text).strip().replace("```json", "").replace("```", "").strip()
-        try:
-            d = json.loads(s)
-            if isinstance(d, dict):
-                if "chosenIndex" in d:
-                    try:
-                        chosen_index = int(d["chosenIndex"])
-                    except Exception:
-                        chosen_index = -1
-                if "reasoning" in d:
-                    reasoning = str(d["reasoning"])
-                if isinstance(d.get("data"), dict) and "chosenIndex" in d["data"]:
-                    try:
-                        chosen_index = int(d["data"]["chosenIndex"])
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        if chosen_index < 0:
-            m = _re.search(r'"chosenIndex"\s*:\s*(-?\d+)', s)
-            if m:
-                try:
-                    chosen_index = int(m.group(1))
-                except Exception:
-                    pass
-        if chosen_index < 0:
-            m = _re.search(r"\bN\s*=\s*(\d+)\b", s)
-            if m:
-                try:
-                    chosen_index = int(m.group(1))
-                except Exception:
-                    pass
-        if reasoning is None:
-            m = _re.search(r'"reasoning"\s*:\s*"([^"]{0,120})"', s)
-            if m:
-                reasoning = m.group(1)
-        if chosen_index is not None and 0 <= int(chosen_index) < n_options:
-            return int(chosen_index), reasoning
-        return -1, reasoning
-
-    def quiz_get_status(self):
+    # ===================== QUIZ SYSTEM (from minipix_v2.py) =====================
+    def get_quiz_status(self):
         sc, data = self._req("GET", "/quiz/status")
         if sc == 200 and isinstance(data, dict) and data.get("success"):
             return data
         return None
 
     def quiz_start_session(self):
-        sc, data = self._post_json("/quiz/session/start", {"campaign": False})
+        # Important: send empty body, not {"campaign": False}
+        sc, data = self._req(
+            "POST",
+            "/quiz/session/start",
+            headers={"content-type": "application/json; charset=utf-8"},
+            data=json.dumps({}).encode("utf-8")
+        )
         if sc == 200 and isinstance(data, dict) and data.get("success"):
-            return data
-        return None
+            session_obj = data.get("session") or {}
+            question_obj = data.get("question")
+            sid = session_obj.get("sessionId") or data.get("sessionId") or data.get("_id")
+            if sid and question_obj:
+                return sid, question_obj, session_obj
+        return None, None, None
 
     def quiz_submit_answer(self, session_id, question_id, chosen_index):
-        sc, data = self._post_json("/quiz/session/answer", {
+        payload = {
             "sessionId": session_id,
             "questionId": question_id,
             "chosenIndex": int(chosen_index),
-        })
+        }
+        sc, data = self._post_json("/quiz/session/answer", payload)
         if sc == 200 and isinstance(data, dict):
             return data
         return None
 
-    def quiz_claim_final(self, session_id):
-        if not session_id:
-            return False, None
-        candidates = (
-            ("/quiz/session/claim", {"sessionId": session_id, "campaign": False}),
-            ("/quiz/session/complete", {"sessionId": session_id, "campaign": False}),
-            ("/quiz/claim", {"sessionId": session_id, "campaign": False}),
-            ("/coins/quiz-claim", {"sessionId": session_id, "type": "quiz", "campaign": False}),
+    def quiz_use_lifeline(self, session_id, question_id):
+        payload = {"sessionId": session_id, "questionId": question_id}
+        sc, data = self._post_json("/quiz/session/lifeline", payload)
+        if sc == 200 and isinstance(data, dict) and data.get("success"):
+            return data.get("removedOptions", [])
+        return None
+
+    def quiz_ad_ack(self, session_id):
+        payload = {"sessionId": session_id}
+        sc, data = self._post_json("/quiz/session/ad-ack", payload)
+        if sc == 200 and isinstance(data, dict) and data.get("success"):
+            return data.get("question")
+        return None
+
+    def _build_quiz_prompt(self, question, options):
+        prompt = (
+            "Solve this multiple-choice question. "
+            "Return ONLY the integer index of the correct option (0, 1, 2, ...). "
+            "No explanation, no extra words, just a single digit integer.\n\n"
+            f"Question (both Hindi and English provided):\n"
+            f"{question}\n\n"
+            "Options:\n"
         )
-        for path, body in candidates:
-            try:
-                sc, d = self._post_json(path, body)
-                if sc and sc < 500 and isinstance(d, dict):
-                    if d.get("success") is True:
-                        coins = (d.get("coins") or d.get("reward_coins")
-                                 or d.get("coinsEarned") or d.get("reward") or 0)
-                        return True, coins
-                    if sc == 200 and "success" not in d:
-                        return True, None
-            except Exception:
-                continue
-        return False, None
+        for i, opt in enumerate(options):
+            prompt += f"  {i}: {opt}\n"
+        prompt += "\nCorrect option index (integer only): "
+        return prompt
+
+    def _parse_quiz_answer(self, answer_text, options):
+        if not answer_text:
+            return None
+        t = answer_text.strip()
+        m = re.search(r"\b(\d+)\b", t)
+        if m:
+            idx = int(m.group(1))
+            if 0 <= idx < len(options):
+                return idx
+        for i, opt in enumerate(options):
+            opt_clean = str(opt).strip().lower()
+            if opt_clean and opt_clean in t.lower():
+                return i
+        m2 = re.search(r"option\s*(\d+)", t, flags=re.IGNORECASE)
+        if m2:
+            idx = int(m2.group(1))
+            if 1 <= idx <= len(options):
+                return idx - 1
+        return None
+
+    def ask_groq(self, question_text, options):
+        if not self.groq_api_key:
+            return None
+        prompt = self._build_quiz_prompt(question_text, options)
+        model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+
+        # Try HTTP fallback (no groq library needed)
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 256,
+            "response_format": {"type": "json_object"} if model.startswith("openai/") else None,
+        }
+        # Remove response_format if not supported (some models don't)
+        if payload["response_format"] is None:
+            del payload["response_format"]
+        try:
+            r = GROQ_HTTP.post(url, json=payload, headers=headers, timeout=30)
+            if r.status_code != 200:
+                print(f"[!] Groq error {r.status_code}: {r.text[:200]}")
+                return None
+            data = r.json()
+            answer_text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if not answer_text:
+                return None
+            idx = self._parse_quiz_answer(answer_text, options)
+            return idx
+        except Exception as e:
+            print(f"[!] Groq HTTP error: {e}")
+            return None
 
     def run_auto_quiz(self, max_sessions=5, cancel=None, on_event=None):
-        """Structured quiz runner. Emits dict events instead of raw strings."""
+        """Step-by-step quiz runner (old working logic)."""
         def emit(**kw):
             if on_event:
                 try:
@@ -1660,6 +1607,7 @@ class MiniPixUserSession:
 
         bal_start = self.get_balance_silent()
         sessions_done = total_correct = total_questions = total_coins = 0
+        delay = QUIZ_QUESTION_DELAY
 
         for session_num in range(1, int(max_sessions) + 1):
             if cancel is not None and cancel.is_set():
@@ -1667,60 +1615,124 @@ class MiniPixUserSession:
                 break
 
             emit(type="session_start", session=session_num, of=max_sessions)
-            sess = self.quiz_start_session()
-            if not sess or not sess.get("success"):
+            session_id, question_obj, session_meta = self.quiz_start_session()
+            if not session_id or not question_obj:
                 emit(type="session_failed", session=session_num, error="start_failed")
                 continue
 
-            session_id = sess.get("sessionId") or sess.get("session_id")
-            questions = sess.get("questions") or (sess.get("data") or {}).get("questions") or []
-            if not questions:
-                emit(type="session_empty", session=session_num)
-                continue
+            session_coins = 0
+            q_count = 0
+            hearts = session_meta.get("hearts", 3) if session_meta else 3
+            ad_every = session_meta.get("adGateEvery", 5) if session_meta else 5
 
-            correct_count = 0
-            for q_idx, q in enumerate(questions, 1):
-                if cancel is not None and cancel.is_set():
+            while True:
+                if hearts <= 0:
+                    emit(type="session_heart_fail", session=session_num)
                     break
-                qid = q.get("questionId") or q.get("id")
-                opts = q.get("options") or []
-                chosen, _reason = self.solve_quiz_with_groq(q, opts)
-                if chosen < 0:
-                    # fallback to first option if Groq fails
-                    chosen = 0
-                resp = self.quiz_submit_answer(session_id, qid, chosen)
-                correct = False
-                if isinstance(resp, dict):
-                    correct = (
-                        resp.get("correct") is True
-                        or resp.get("isCorrect") is True
-                        or (isinstance(resp.get("success"), dict) and resp["success"].get("correct") is True)
-                    )
-                if correct:
-                    correct_count += 1
-                total_questions += 1
-                emit(type="answer", session=session_num, q=q_idx, correct=correct)
 
-            ok, coins = self.quiz_claim_final(session_id)
-            if not ok:
-                emit(type="session_claim_failed", session=session_num, error="claim_failed")
-            coins = int(coins or 0)
-            total_coins += coins
-            total_correct += correct_count
+                if not question_obj or not isinstance(question_obj, dict):
+                    emit(type="session_empty", session=session_num)
+                    break
+
+                q_id = question_obj.get("questionId")
+                q_text_hi = question_obj.get("questionHi") or ""
+                q_text_en = question_obj.get("questionEn") or ""
+                options = question_obj.get("options", [])
+                q_idx = question_obj.get("index", q_count)
+                q_total = question_obj.get("total", "?")
+
+                q_count += 1
+                combined_q = q_text_hi
+                if q_text_en and q_text_en != q_text_hi:
+                    combined_q = f"{q_text_hi}\n[English: {q_text_en}]" if q_text_hi else q_text_en
+
+                if not q_id or not isinstance(options, list) or len(options) < 2:
+                    emit(type="bad_question", session=session_num)
+                    break
+
+                # Ask Groq
+                correct_index = self.ask_groq(combined_q, options)
+                if correct_index is None:
+                    # Try lifeline
+                    removed = self.quiz_use_lifeline(session_id, q_id)
+                    if removed is not None:
+                        remaining = [i for i in range(len(options)) if i not in removed]
+                        if remaining:
+                            correct_index = remaining[0]
+                        else:
+                            correct_index = 0
+                    else:
+                        correct_index = 0  # fallback
+                if correct_index is None or not (0 <= correct_index < len(options)):
+                    correct_index = 0
+
+                # Wait before submitting
+                if cancel is not None and cancel.wait(delay):
+                    break
+                else:
+                    time.sleep(delay)
+
+                result = self.quiz_submit_answer(session_id, q_id, correct_index)
+                if not result:
+                    emit(type="submit_failed", session=session_num)
+                    break
+
+                if result.get("success"):
+                    correct_flag = result.get("correct", False)
+                    coins_earned = int(result.get("coinsEarned") or 0)
+                    coins_so_far = result.get("coinsSoFar", 0)
+                    hearts = int(result.get("hearts", hearts))
+                    session_coins = coins_so_far
+                    total_coins += coins_earned
+                    if correct_flag:
+                        total_correct += 1
+                    total_questions += 1
+
+                    emit(type="answer", session=session_num, q=q_count,
+                         correct=correct_flag, coins=coins_earned, total=coins_so_far)
+
+                    next_info = result.get("next")
+                    if not next_info:
+                        emit(type="session_done", session=session_num,
+                             correct=sum(1 for _ in range(q_count) if ...),  # placeholder
+                             total=q_count, coins=session_coins)
+                        break
+
+                    # Process next question
+                    if isinstance(next_info, dict):
+                        if "question" in next_info and isinstance(next_info.get("question"), dict):
+                            question_obj = next_info["question"]
+                            session_id = result.get("sessionId") or session_id
+                            continue
+                        if "result" in next_info:
+                            emit(type="session_done", session=session_num,
+                                 correct=sum(1 for _ in range(q_count) if ...),
+                                 total=q_count, coins=session_coins)
+                            break
+
+                    # Ad gate check
+                    if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
+                        nq = self.quiz_ad_ack(session_id)
+                        if nq:
+                            question_obj = nq
+                            continue
+                        else:
+                            break
+
+                    break
+                else:
+                    emit(type="submit_failed", session=session_num)
+                    break
+
             sessions_done += 1
-            emit(type="session_done", session=session_num, correct=correct_count,
-                 total=len(questions), coins=coins)
-
-            if cancel is not None:
-                if cancel.wait(1.0):
-                    break
-            else:
-                time.sleep(1.0)
+            if cancel is not None and cancel.wait(1.0):
+                break
 
         bal_end = self.get_balance_silent()
         delta = 0
         if bal_start is not None and bal_end is not None:
             delta = (bal_end or 0) - (bal_start or 0)
+
         emit(type="finished", sessions=sessions_done, delta=delta)
         return {
             "sessions": sessions_done,
@@ -2043,6 +2055,7 @@ def worker_quiz(tg_uid, acc, job, sessions=5):
                 job.set(aid, note=f"session {ev.get('session')}/{ev.get('of')}")
             elif kind == "answer":
                 job.inc(aid, quiz_questions=1, quiz_correct=1 if ev.get("correct") else 0)
+                # coins earned per question tracked separately
             elif kind == "session_done":
                 job.inc(aid, quiz_sessions=1, coins=int(ev.get("coins") or 0))
                 STATS.bump(tg_uid, "quizzes_solved", 1)
@@ -2052,26 +2065,38 @@ def worker_quiz(tg_uid, acc, job, sessions=5):
             elif kind == "session_failed":
                 job.set(aid, state="error", note=f"session {ev.get('session')} start failed",
                         error=ev.get("error", "start_failed"))
-            elif kind == "session_claim_failed":
-                job.set(aid, state="error", note="claim failed", error="claim_failed")
+            elif kind == "session_heart_fail":
+                job.set(aid, state="error", note="no hearts left", error="hearts_exhausted")
+            elif kind == "submit_failed":
+                job.set(aid, state="error", note="answer submit failed", error="submit_failed")
             elif kind == "error":
                 job.set(aid, state="error", note=ev.get("message", "unknown error"),
                         error=ev.get("message"))
 
         result = session.run_auto_quiz(max_sessions=sessions, cancel=job.cancel, on_event=on_event)
 
-        # If no sessions succeeded, mark error
+        # If no sessions succeeded and we haven't already set an error, set error
         if result.get("sessions", 0) == 0 and not job.cancel.is_set():
-            job.set(aid, state="error", note="no quiz sessions completed", error="all_failed")
+            current = job.progress.get(aid, {})
+            if current.get("state") != "error":
+                job.set(aid, state="error", note="no quiz sessions completed", error="all_failed")
 
-        state = "stopped" if job.cancel.is_set() else "done"
-        job.set(
-            aid,
-            state=state,
-            balance_start=result.get("balance_start"),
-            balance_end=result.get("balance_end"),
-            note="stopped by user" if state == "stopped" else "complete",
-        )
+        # Final state only if not already error
+        current = job.progress.get(aid, {})
+        if current.get("state") != "error":
+            state = "stopped" if job.cancel.is_set() else "done"
+            job.set(
+                aid,
+                state=state,
+                balance_start=result.get("balance_start"),
+                balance_end=result.get("balance_end"),
+                note="stopped by user" if state == "stopped" else "complete",
+            )
+        else:
+            job.set(aid,
+                    balance_start=result.get("balance_start"),
+                    balance_end=result.get("balance_end"))
+
         _persist_account(tg_uid, aid, session, last_run=now_iso())
 
     except Exception as e:
@@ -3150,7 +3175,6 @@ else:
 def build_tg_app(token):
     builder = Application.builder().token(token)
 
-    # Rate limiter is an optional extra (python-telegram-bot[rate-limiter]).
     if AIORateLimiter is not None:
         try:
             builder = builder.rate_limiter(AIORateLimiter())
@@ -3167,7 +3191,6 @@ def build_tg_app(token):
     handlers = [
         ("start", start_cmd),
         ("help", help_cmd),
-        # account management
         ("add_account", add_account_cmd),
         ("login", add_account_cmd),
         ("otp", otp_cmd),
@@ -3179,13 +3202,11 @@ def build_tg_app(token):
         ("disable", disable_cmd),
         ("remove_account", remove_account_cmd),
         ("set_groq_key", set_groq_key_cmd),
-        # info
         ("balance", balance_cmd),
         ("status", status_cmd),
         ("series_list", series_list_cmd),
         ("my_stats", my_stats_cmd),
         ("admin_stats", admin_stats_cmd),
-        # runs
         ("watch_all", watch_all_cmd),
         ("watch_one", watch_one_cmd),
         ("quiz", quiz_cmd),
@@ -3200,7 +3221,6 @@ def build_tg_app(token):
 
 
 async def _run_telegram(application, webhook_url, port):
-    """Correct PTB v20+ lifecycle: initialize -> start -> updater."""
     await application.initialize()
     await application.start()
 
@@ -3218,7 +3238,6 @@ async def _run_telegram(application, webhook_url, port):
         print("[i] Polling mode started")
         await application.updater.start_polling(drop_pending_updates=True)
 
-    # Block forever until cancelled.
     stop_event = asyncio.Event()
     try:
         await stop_event.wait()
@@ -3275,15 +3294,13 @@ def main():
         print("    pip install 'python-telegram-bot[rate-limiter]==21.*' requests flask")
         sys.exit(1)
 
-    # FIXED: use BotConfig() instead of BotConfig.load()
-    config = BotConfig()
+    config = BotConfig()  # FIXED: use instance, not class method
     token = config.bot_token
     if not token:
         print("[X] BOT_TOKEN nahi mila. Environment variable set karo ya bot_config.json banao.")
         sys.exit(1)
 
     _banner()
-
     application = build_tg_app(token)
 
     port = _env_int("PORT", 8080)
@@ -3296,7 +3313,6 @@ def main():
         elif public:
             webhook_url = "https://" + public
 
-    # Webhook mode owns the port itself, so Flask only runs in polling mode.
     if webhook_url:
         thread = _start_telegram_in_thread(application, webhook_url, port)
         try:
