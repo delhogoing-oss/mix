@@ -3250,7 +3250,7 @@ def main():
         print("    pip install 'python-telegram-bot[rate-limiter]==21.*' requests flask")
         sys.exit(1)
 
-    config = BotConfig.load()
+   config = BOT_CONFIG
     token = config.bot_token
     if not token:
         print("[X] BOT_TOKEN nahi mila. Environment variable set karo ya bot_config.json banao.")
