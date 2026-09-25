@@ -3,12 +3,12 @@
 MiniPix Unified Telegram Bot (SINGLE FILE)
 Combines:
   • main.py        – Telegram bot framework + Groq Quiz Solver (BEST)
-  • minipix_auto.py – Option 11: Browse ALL + SMART 8x REPEAT Auto-Watch (BEST)
+  • minipix_auto.py – Option 11: Browse ALL + Auto-Watch Each Ep 1x (BEST)
 Features:
   • Per-user Telegram isolation + busy lock
   • threading.Lock for shared JSON I/O
   • Login via OTP, interactive token, or /tokenlogin <token>
-  • 8x reward (15→8→5→3→2→2→2→2 coins) with daily-cap-aware smart repeat
+  • 1x reward (15 coins/ep max) with daily-cap-aware watch
   • Groq AI per-user API key for auto quiz (default gpt-oss-120b)
   • Full login / activity logs to DATA_LOG_CHANNEL
   • App version 328 headers + updated API path compatibility
@@ -273,10 +273,7 @@ MONGO_TLS_INSECURE = os.environ.get("MONGO_TLS_INSECURE", "1") == "1"
 MAX_GROQ_KEYS_PER_USER = 5
 
 GROQ_MODELS = [
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
-    "qwen/qwen3.6-27b",
     "allam-2-7b",
 ]
 
@@ -290,7 +287,7 @@ _OKHTTP_VERSIONS = [
     "okhttp/4.7.2",
 ]
 
-_APP_VERSIONS = ["326", "327", "328", "329", "330"]
+_APP_VERSIONS = ["332"]
 
 _DEVICE_BRANDS = [
     "Xiaomi", "Xiaomi Redmi", "Xiaomi Poco", "Samsung", "OnePlus",
@@ -372,26 +369,11 @@ def generate_user_agent() -> str:
 
 
 def generate_headers() -> Dict[str, str]:
-    headers = {
+    return {
         "user-agent": generate_user_agent(),
-        "accept-encoding": random.choice(["gzip", "gzip, deflate"]),
+        "accept-encoding": "gzip",
         "x-app-version": random.choice(_APP_VERSIONS),
     }
-    extra = random.choice(_NETWORK_HEADERS)
-    headers.update(extra)
-    if random.random() < 0.4:
-        headers["x-device-lang"] = random.choice(["en", "hi", "en-IN"])
-    if random.random() < 0.3:
-        headers["x-manufacturer"] = random.choice(_MANUFACTURER_LIST)
-    if random.random() < 0.25:
-        headers["x-android-id"] = _rand_hex(16)
-    if random.random() < 0.2:
-        headers["x-install-ref"] = random.choice([
-            "com.android.vending",
-            "organic",
-            "utm_source=google-play&utm_medium=organic",
-        ])
-    return headers
 
 
 def jitter(base: float, amount: float = 0.6, min_val: float = 0.0) -> float:
@@ -429,7 +411,7 @@ def make_progress_steps(nth_watch: Optional[int] = None) -> List[int]:
 HEADERS_BASE = {
     "user-agent": "okhttp/4.12.0",
     "accept-encoding": "gzip",
-    "x-app-version": "328",
+    "x-app-version": "332",
 }
 
 logging.basicConfig(
@@ -438,7 +420,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-(WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS) = range(4)
+(WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS, WAIT_MULTI_QUIZ_ACCOUNTS, WAIT_MULTI_QUIZ_LEVEL, WAIT_MULTI_QUIZ_CONFIRM, WAIT_RUNQUIZ_SESSIONS, WAIT_MULTI_QUIZ_TOTAL_ROTATIONS) = range(9)
 
 _accounts_lock = threading.Lock()
 _groq_lock = threading.Lock()
@@ -769,29 +751,37 @@ class MiniPixV2:
         self.device_id = generate_device_id()
         self.device_info = generate_device_info()
         self._req_counter = 0
+        self._device_frozen = False
+        self._session_active = False
         self._rotate_headers(full=True)
         self.watch_history = {}
         self.watch_history_raw = []
         self.runtime_watch_counts = {}
         self.last_profile = {}
         self.current_account_label = None
+        self.referral_code = None
+        self.referred_by = None
+        self.login_source = None
+        self.telegram_owner_id = None
         self.accounts = self._load_accounts()
 
     def _rotate_headers(self, full=False):
+        if self._session_active:
+            return
         try:
             cur_auth = self.session.headers.get("authorization") if hasattr(self, "session") else None
         except Exception:
             cur_auth = None
         new_hdrs = generate_headers()
-        if full:
-            self.device_id = generate_device_id()
-            self.device_info = generate_device_info()
-            new_hdrs["x-device-id"] = self.device_id
-        else:
-            if random.random() < 0.2:
+        if not self._device_frozen:
+            if full:
                 self.device_id = generate_device_id()
-            if random.random() < 0.15:
                 self.device_info = generate_device_info()
+            else:
+                if random.random() < 0.2:
+                    self.device_id = generate_device_id()
+                if random.random() < 0.15:
+                    self.device_info = generate_device_info()
         try:
             self.session.headers.clear()
             self.session.headers.update(new_hdrs)
@@ -805,6 +795,7 @@ class MiniPixV2:
 
     def _load_accounts(self):
         base = {}
+        owner_id = self.telegram_owner_id
         candidates = [ACCOUNTS_FILE]
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -827,21 +818,35 @@ class MiniPixV2:
                             if isinstance(loaded, dict):
                                 for k, v in loaded.items():
                                     if isinstance(v, dict) and v.get("access_token"):
+                                        v_owner = v.get("telegram_owner_id")
+                                        if owner_id is None:
+                                            pass
+                                        elif v_owner is None:
+                                            pass
+                                        elif v_owner != owner_id:
+                                            continue
                                         base[k] = {
                                             "access_token": v.get("access_token", ""),
                                             "user_id": v.get("user_id") or v.get("uid") or v.get("_id"),
                                             "profile_id": v.get("profile_id") or v.get("master_profile") or v.get("pid"),
                                             "phone": v.get("phone") or v.get("mobile"),
                                             "added_on": v.get("added_on") or date.today().isoformat(),
+                                            "telegram_owner_id": v_owner,
                                         }
             except Exception:
                 pass
         try:
             col = _mongo_accounts_col()
             if col is not None:
-                for doc in col.find({}, max_time_ms=MONGO_CONNECT_TIMEOUT_MS):
+                query = {}
+                if owner_id is not None:
+                    query = {"$or": [{"telegram_owner_id": owner_id}, {"telegram_owner_id": {"$exists": False}}]}
+                for doc in col.find(query, max_time_ms=MONGO_CONNECT_TIMEOUT_MS):
                     lbl = doc.get("label")
                     if not lbl:
+                        continue
+                    doc_owner = doc.get("telegram_owner_id")
+                    if owner_id is not None and doc_owner is not None and doc_owner != owner_id:
                         continue
                     entry = {
                         "access_token": doc.get("access_token", ""),
@@ -849,6 +854,7 @@ class MiniPixV2:
                         "profile_id": doc.get("profile_id"),
                         "phone": doc.get("phone"),
                         "added_on": doc.get("added_on") or date.today().isoformat(),
+                        "telegram_owner_id": doc_owner,
                     }
                     if entry["access_token"]:
                         base[lbl] = entry
@@ -857,6 +863,7 @@ class MiniPixV2:
         return base
 
     def _save_accounts(self):
+        owner_id = self.telegram_owner_id
         payload = {"accounts": self.accounts, "saved_at": date.today().isoformat()}
         ok_json = False
         try:
@@ -883,13 +890,20 @@ class MiniPixV2:
                         "added_on": acc.get("added_on") or date.today().isoformat(),
                         "last_updated": now_iso,
                         "bot_id": bot_id,
+                        "telegram_owner_id": owner_id,
                     }
                     if not doc["access_token"]:
                         continue
                     try:
-                        col.replace_one({"label": label}, doc, upsert=True)
+                        filt = {"label": label}
+                        if owner_id is not None:
+                            filt = {"$or": [{"label": label, "telegram_owner_id": owner_id}, {"label": label, "telegram_owner_id": {"$exists": False}}]}
+                        col.replace_one(filt, doc, upsert=True)
                     except Exception:
-                        continue
+                        try:
+                            col.replace_one({"label": label, "telegram_owner_id": owner_id}, doc, upsert=True)
+                        except Exception:
+                            continue
         except Exception:
             pass
         return ok_json
@@ -910,6 +924,8 @@ class MiniPixV2:
             "profile_id": self.profile_id,
             "phone": self.phone,
             "added_on": date.today().isoformat(),
+            "telegram_owner_id": self.telegram_owner_id,
+            "_cached_balance": getattr(self, "_cached_balance", None),
         }
         return self._save_accounts()
 
@@ -947,8 +963,16 @@ class MiniPixV2:
         self._save_accounts()
         try:
             col = _mongo_accounts_col()
-            if col is not None:
-                col.delete_one({"label": label})
+            if col is not None and self.telegram_owner_id is not None:
+                filt = {"label": label, "telegram_owner_id": self.telegram_owner_id}
+                try:
+                    col.delete_one(filt)
+                except Exception:
+                    filt2 = {"$or": [{"label": label, "telegram_owner_id": self.telegram_owner_id}, {"label": label, "telegram_owner_id": {"$exists": False}}]}
+                    try:
+                        col.delete_one(filt2)
+                    except Exception:
+                        pass
         except Exception:
             pass
         if self.current_account_label == label:
@@ -965,23 +989,27 @@ class MiniPixV2:
         self.watch_history_raw = []
         self.runtime_watch_counts = {}
         self.last_profile = {}
+        self.referral_code = None
+        self.referred_by = None
+        self.login_source = None
+        self._device_frozen = False
+        self._session_active = False
         if "authorization" in self.session.headers:
             del self.session.headers["authorization"]
 
     def _req(self, method, path, **kwargs):
         url = f"{API_BASE}{path}"
         self._req_counter += 1
-        if self._req_counter % random.randint(8, 25) == 0:
+        if not self._session_active and self._req_counter % random.randint(8, 25) == 0:
             self._rotate_headers(full=random.random() < 0.25)
         try:
-            hdrs = kwargs.get("headers") or {}
-            if "x-device-id" not in hdrs and random.random() < 0.5:
-                hdrs["x-device-id"] = self.device_id
-                kwargs["headers"] = hdrs
             pre_sleep = jitter(3, 0.8, 0)
             if pre_sleep > 0:
                 time.sleep(pre_sleep / 1000.0)
-            timeout_val = random.randint(20, 45)
+            if "timeout" in kwargs:
+                timeout_val = kwargs.pop("timeout")
+            else:
+                timeout_val = random.randint(20, 45)
             r = self.session.request(method, url, timeout=timeout_val, **kwargs)
             try:
                 data = r.json()
@@ -1002,7 +1030,10 @@ class MiniPixV2:
         sc, data = self._req(
             "POST",
             "/login/generate-otp",
-            headers={"content-type": "application/json; charset=utf-8"},
+            headers={
+                "content-type": "application/json; charset=utf-8",
+                "x-minipix-integrity-error": "ERR_8000",
+            },
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
         send_log_sync(
@@ -1040,6 +1071,10 @@ class MiniPixV2:
             self.access_token = data["access_token"]
             self.user_id = data.get("id") or data.get("_id")
             self.session.headers["authorization"] = f"Bearer {self.access_token}"
+            jwt_payload = self._decode_jwt_payload(self.access_token)
+            if isinstance(jwt_payload, dict) and jwt_payload.get("nonce"):
+                self.device_id = str(jwt_payload["nonce"])
+            self._device_frozen = True
             self.get_user()
             self._store_current_account(save_label)
             ref_code = (
@@ -1053,6 +1088,9 @@ class MiniPixV2:
                 or (isinstance(data.get("user"), dict) and data["user"].get("referredBy"))
             )
             source = data.get("source")
+            self.referral_code = ref_code
+            self.referred_by = ref_by
+            self.login_source = source
             send_log_sync(
                 f"✅ OTP LOGIN SUCCESS\n"
                 f"User ID: <code>{self.user_id}</code>\n"
@@ -1105,11 +1143,14 @@ class MiniPixV2:
     def login_with_token(self, token, user_id=None, profile_id=None, label=None, phone=None):
         if not token:
             return False
-        self._rotate_headers(full=True)
-        medium_sleep(random.randint(120, 380))
         raw = None
         sc = 0
         jwt = self._decode_jwt_payload(token)
+        self._rotate_headers(full=True)
+        if isinstance(jwt, dict) and jwt.get("nonce"):
+            self.device_id = str(jwt["nonce"])
+        self._device_frozen = True
+        medium_sleep(random.randint(120, 380))
         if not user_id and isinstance(jwt, dict):
             user_id = (
                 jwt.get("userId")
@@ -1157,6 +1198,9 @@ class MiniPixV2:
             ref_code = raw.get("referralCode") or raw.get("referral_code")
             ref_by = raw.get("referredBy") or raw.get("referred_by")
             source = raw.get("source") or raw.get("signupSource")
+        self.referral_code = ref_code
+        self.referred_by = ref_by
+        self.login_source = source
         send_log_sync(
             f"✅ TOKEN LOGIN SUCCESS\n"
             f"User ID: <code>{self.user_id}</code>\n"
@@ -1237,13 +1281,13 @@ class MiniPixV2:
         if not self.access_token:
             return False
         try:
-            if full:
+            if full and not self._device_frozen:
                 self.refresh_session_fingerprint(full=True)
             else:
                 self.refresh_session_fingerprint(full=False)
         except Exception:
             try:
-                self._rotate_headers(full=full)
+                self._rotate_headers(full=(full and not self._device_frozen))
                 if self.access_token:
                     self.session.headers["authorization"] = f"Bearer {self.access_token}"
             except Exception:
@@ -1296,6 +1340,78 @@ class MiniPixV2:
         medium_sleep(random.randint(200, 700))
         return bool(ok_me or ok_user or qs_ok)
 
+    def _token_relogin_full_reset(self, progress_log_fn=None):
+        saved_token = getattr(self, "access_token", None)
+        saved_label = getattr(self, "current_account_label", None)
+        saved_phone = getattr(self, "phone", None)
+        saved_user_id = getattr(self, "user_id", None)
+        saved_profile_id = getattr(self, "profile_id", None)
+        if not saved_token:
+            if progress_log_fn:
+                try:
+                    progress_log_fn("❌ Token relogin failed: no saved token available.")
+                except Exception:
+                    pass
+            return False
+        def _plog(msg):
+            if progress_log_fn:
+                try:
+                    progress_log_fn(msg)
+                except Exception:
+                    pass
+            send_log_sync(f"🔑 TOKEN RE-LOGIN TRIGGER (enabled=false bypass) | User: <code>{saved_label or saved_user_id or saved_phone or '?'}</code>")
+        try:
+            self._reset_state()
+        except Exception:
+            pass
+        medium_sleep(random.randint(300, 800))
+        relabel = (
+            saved_label
+            or saved_phone
+            or (f"acc_{str(saved_user_id)[-6:]}" if saved_user_id else None)
+        )
+        ok = self.login_with_token(
+            saved_token,
+            user_id=saved_user_id,
+            profile_id=saved_profile_id,
+            label=relabel,
+            phone=saved_phone,
+        )
+        if ok:
+            _plog(f"✅ Token Re-login via saved token successful (device_id bound to JWT nonce).")
+            try:
+                self.open_app()
+            except Exception:
+                pass
+            try:
+                self.integrity_attest()
+            except Exception:
+                pass
+            medium_sleep(random.randint(200, 600))
+            return True
+        _plog("⚠️ login_with_token returned False — fallback to manual refresh.")
+        try:
+            jwt = self._decode_jwt_payload(saved_token)
+            if isinstance(jwt, dict) and jwt.get("nonce"):
+                self.device_id = str(jwt["nonce"])
+            self._rotate_headers(full=False)
+            self.access_token = saved_token
+            if saved_user_id and not self.user_id:
+                self.user_id = saved_user_id
+            if saved_profile_id and not self.profile_id:
+                self.profile_id = saved_profile_id
+            if saved_phone and not self.phone:
+                self.phone = saved_phone
+            try:
+                self.session.headers["authorization"] = f"Bearer {saved_token}"
+            except Exception:
+                pass
+            self._device_frozen = True
+            self._refresh_auth_state(full=False, with_quiz_status=True)
+        except Exception:
+            pass
+        return bool(self.access_token is not None)
+
     def open_app(self):
         if not (self.user_id and self.profile_id):
             try:
@@ -1307,7 +1423,7 @@ class MiniPixV2:
         payload = {"openApp": {"_id": self.user_id, "date": date.today().isoformat()}}
         sc, data = self._req(
             "PATCH",
-            f"/users/{self.user_id}/profiles/{self.profile_id}/open_app",
+            f"/users/{self.user_id}/profiles/{self.profile_id}",
             headers={"content-type": "application/json; charset=utf-8"},
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
@@ -1360,14 +1476,92 @@ class MiniPixV2:
 
     def get_balance(self):
         sc, data = self._req("GET", "/coins/balance")
+        coins = None
         if sc == 200 and isinstance(data, dict):
             coins = data.get("coins", 0)
             if isinstance(coins, dict):
                 coins = coins.get("coins", 0)
+            try:
+                coins = int(coins)
+            except Exception:
+                coins = None
+        elif sc == 200 and isinstance(data, (int, float)):
+            coins = int(data)
+        elif sc == 200 and isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+            coins = data[0].get("coins")
+            if isinstance(coins, dict):
+                coins = coins.get("coins")
+            try:
+                coins = int(coins) if coins is not None else None
+            except Exception:
+                coins = None
+        cached = getattr(self, "_cached_balance", None)
+        try:
+            cached_int = int(cached) if cached is not None else None
+        except Exception:
+            cached_int = None
+        if isinstance(coins, int):
+            try:
+                setattr(self, "_cached_balance", coins)
+            except Exception:
+                pass
             return coins
-        if sc == 200 and isinstance(data, (int, float)):
-            return int(data)
-        return None
+        if cached_int is not None:
+            return cached_int
+        return 0 if coins is None else coins
+
+    def get_balance_robust(self, retries=3):
+        best = None
+        last_seen_cached = None
+        try:
+            c = getattr(self, "_cached_balance", None)
+            if c is not None:
+                last_seen_cached = int(c)
+        except Exception:
+            last_seen_cached = None
+        for i in range(retries):
+            try:
+                val = self.get_balance()
+            except Exception:
+                val = None
+            try:
+                vi = int(val) if val is not None else None
+            except Exception:
+                vi = None
+            if isinstance(vi, int) and vi > 0:
+                try:
+                    setattr(self, "_cached_balance", vi)
+                except Exception:
+                    pass
+                return vi
+            if isinstance(vi, int):
+                if best is None:
+                    best = vi
+                elif vi > best:
+                    best = vi
+                    try:
+                        setattr(self, "_cached_balance", vi)
+                    except Exception:
+                        pass
+            if i < retries - 1:
+                time.sleep(random.uniform(0.8, 2.2))
+        try:
+            cached_now = getattr(self, "_cached_balance", None)
+            cached_i = int(cached_now) if cached_now is not None else None
+            if isinstance(cached_i, int):
+                if best is None or cached_i > best:
+                    best = cached_i
+        except Exception:
+            pass
+        try:
+            if isinstance(last_seen_cached, int):
+                if best is None or (best is not None and last_seen_cached > 0 and best <= 0):
+                    best = last_seen_cached
+        except Exception:
+            pass
+        if best is not None:
+            return best
+        return 0
 
     def get_balance_silent(self):
         return self.get_balance()
@@ -1689,136 +1883,47 @@ class MiniPixV2:
             watched_pct = int(watched_pct or 0)
         except Exception:
             watched_pct = 0
-        if not tc_in_ms:
-            tc_in_ms = 0
-        if not tc_out_ms or tc_out_ms <= tc_in_ms:
-            tc_out_ms = tc_in_ms + 60000
-        duration = tc_out_ms - tc_in_ms
+        pct_decimal = watched_pct / 100.0 if watched_pct > 1 else watched_pct
         if watched_pct >= 100:
-            current_time_ms = tc_out_ms
+            progress_val = 100
+        elif watched_pct <= 1:
+            progress_val = int(watched_pct * 100)
         else:
-            current_time_ms = int(tc_in_ms + (duration * watched_pct / 100))
-        if watched_pct == 99:
-            stored_pct = 99
-        elif watched_pct >= 100:
-            stored_pct = 100
-        else:
-            stored_pct = watched_pct
+            progress_val = watched_pct
         watch_obj = {
             "id": series_id,
-            "title": series_title,
-            "hindiTitle": hindi_title,
+            "title": series_title or "Series",
+            "hindiTitle": "",
             "episodeNo": episode_no,
-            "tcInMs": tc_in_ms,
-            "tcOutMs": tc_out_ms,
-            "detailImage": detail_image,
+            "tcInMs": 0,
+            "tcOutMs": 180000,
+            "detailImage": "",
             "type": "episode",
-            "progress": 100 if watched_pct >= 100 else watched_pct,
-            "time": current_time_ms,
-            "watchedPct": stored_pct,
+            "progress": progress_val,
+            "time": int(pct_decimal * 1800),
+            "watchedPct": pct_decimal,
             "campaign": False,
         }
-        ok1 = False
+        ok = False
         try:
             payload_patch = {"watched": watch_obj}
-            sc1, d1 = self._req(
+            sc, d = self._req(
                 "PATCH",
                 f"/users/{self.user_id}/profiles/{self.profile_id}",
                 headers={"content-type": "application/json; charset=utf-8"},
                 data=json.dumps(payload_patch, ensure_ascii=False).encode("utf-8"),
             )
-            ok1 = sc1 == 200 and isinstance(d1, dict) and d1.get("success")
+            ok = sc == 200 and isinstance(d, dict) and d.get("success")
         except Exception:
             pass
-
-        ok2 = False
-        try:
-            for path in (
-                f"/users/{self.user_id}/profiles/{self.profile_id}/watch-history/update",
-                "/watch-history/update",
-                f"/profiles/{self.profile_id}/watch-history/update",
-            ):
-                payload_wh = {"watched": watch_obj, "campaign": False}
-                sc2, d2 = self._req(
-                    "POST",
-                    path,
-                    headers={"content-type": "application/json; charset=utf-8"},
-                    data=json.dumps(payload_wh, ensure_ascii=False).encode("utf-8"),
-                )
-                if sc2 and sc2 < 500:
-                    if isinstance(d2, dict) and d2.get("success"):
-                        ok2 = True
-                        break
-                    if sc2 == 200:
-                        ok2 = True
-                        break
-        except Exception:
-            pass
-        return ok1 or ok2
+        return ok
 
     def _report_watch_progress_to_coins(
         self, series_id, episode_no, watched_pct, series_title=""
     ):
         if not (self.user_id and self.profile_id):
             return False
-        try:
-            watched_pct = int(watched_pct or 0)
-        except Exception:
-            watched_pct = 0
-        ep_str = str(episode_no)
-        bodies = [
-            {
-                "series_id": series_id,
-                "episode_no": episode_no,
-                "episodeNo": episode_no,
-                "progress": watched_pct,
-                "watchedPct": watched_pct,
-                "campaign": False,
-                "task_type": "watch_ladder",
-            },
-            {
-                "type": "watch_ladder",
-                "seriesId": series_id,
-                "episode": ep_str,
-                "watched": watched_pct,
-                "campaign": False,
-            },
-            {
-                "task_id": f"watch_ladder_{series_id}",
-                "progress_delta": 1,
-                "series_id": series_id,
-                "episode_no": episode_no,
-                "campaign": False,
-            },
-        ]
-        endpoints = [
-            ("POST", "/coins/progress-report", bodies[0]),
-            ("POST", "/coins/tasks/progress", bodies[0]),
-            ("POST", f"/coins/tasks/watch_ladder_{series_id}/progress", bodies[0]),
-            ("POST", "/coins/watch-progress", bodies[1]),
-            ("POST", "/coins/report-watched", bodies[1]),
-            ("POST", "/coins/tasks/update", bodies[2]),
-            ("POST", "/watch-ladder/progress", bodies[0]),
-        ]
-        any_ok = False
-        for method, path, body in endpoints:
-            try:
-                sc, d = self._req(
-                    method,
-                    path,
-                    headers={"content-type": "application/json; charset=utf-8"},
-                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                )
-                if sc and sc < 500 and isinstance(d, dict):
-                    if d.get("success") is True:
-                        any_ok = True
-                        break
-                    if sc == 200 and "success" not in d:
-                        any_ok = True
-                        break
-            except Exception:
-                continue
-        return any_ok
+        return True
 
     def _start_task_for_series(self, series_id):
         task_id = f"watch_ladder_{series_id}"
@@ -2007,9 +2112,12 @@ class MiniPixV2:
         allow_repeat=False,
         nth_watch=None,
     ):
+        self._session_active = True
         if not isinstance(series_info, dict):
+            self._session_active = False
             return False, "invalid_series"
         if not isinstance(episode, dict):
+            self._session_active = False
             return False, "invalid_episode"
         series_id = (
             series_info.get("_id")
@@ -2047,6 +2155,7 @@ class MiniPixV2:
             self.watch_history.get(history_key, {}).get("watchedPct", 0) or 0
         )
         if not allow_repeat and current_pct >= min_watch_pct:
+            self._session_active = False
             return True, "skip"
 
         if not episode.get("coinUnlocked", True):
@@ -2140,9 +2249,10 @@ class MiniPixV2:
                 "time": tc_out_ms,
             }
         )
+        self._session_active = False
         return True, "done"
 
-    # ─────────────────── OPTION 11: Browse ALL + SMART 8x REPEAT Watch (BEST)
+    # ─────────────────── OPTION 11: Browse ALL + Auto-Watch Each Episode 1x (BEST)
     def browse_and_watch_all_smart_repeat(
         self,
         progress_callback=None,
@@ -2174,8 +2284,8 @@ class MiniPixV2:
                 )
 
         log(
-            f"🌐 Option 11 mode: Browse ALL + SMART 8x REPEAT\n"
-            f"Rewards/ep: 1=+15 | 2=+8 | 3=+5 | 4=+3 | 5-8=+2 each (total +39/ep)\n"
+            f"🌐 Option 11 mode: Browse ALL + 1x Watch Each Episode\n"
+            f"Reward/ep: +15 coins (1x max per ep)\n"
             f"Checking campaign..."
         )
         cap_status = self.get_campaign_status()
@@ -2240,7 +2350,7 @@ class MiniPixV2:
                     return True
             return False
 
-        log(f"Series found: {len(all_series)}. Fast watch mode = ALL series, 1x each ep.")
+        log(f"Series found: {len(all_series)}. Watch mode = ALL series, 1x each episode.")
 
         for idx, s in enumerate(all_series, 1):
             if max_watches is not None and total_watched_all >= max_watches:
@@ -2295,48 +2405,39 @@ class MiniPixV2:
                 pass
 
             series_done = series_skip = series_fail = 0
-            any_series_progress = True
-            loop_count = 0
-            while any_series_progress:
-                loop_count += 1
-                any_series_progress = False
-                if loop_count > MAX_WATCHES_PER_EP + 1:
+            inner_ep_counter = 0
+            for ep in episodes_sorted:
+                inner_ep_counter += 1
+                if max_watches is not None and total_watched_all >= max_watches:
                     break
-                inner_ep_counter = 0
-                for ep in episodes_sorted:
-                    inner_ep_counter += 1
-                    if max_watches is not None and total_watched_all >= max_watches:
-                        break
-                    if _check_daily_cap(total_watched_all):
-                        break
-                    ep_no = (
-                        ep.get("episodeNo") or ep.get("episode_no") or 0
+                if _check_daily_cap(total_watched_all):
+                    break
+                ep_no = (
+                    ep.get("episodeNo") or ep.get("episode_no") or 0
+                )
+                key_pair = (str(real_sid), str(ep_no))
+                cur_count = watch_counts.get(key_pair, 0)
+                if cur_count >= 1:
+                    continue
+                if inner_ep_counter > 1 and random.random() < 0.05:
+                    short_sleep(random.randint(8, 45))
+                try:
+                    ok, status = self.watch_episode(
+                        ep,
+                        real_info or s,
+                        allow_repeat=False,
+                        nth_watch=1,
                     )
-                    key_pair = (str(real_sid), str(ep_no))
-                    cur_count = watch_counts.get(key_pair, 0)
-                    if cur_count >= MAX_WATCHES_PER_EP:
-                        continue
-                    nth = cur_count + 1
-                    if inner_ep_counter > 1 and random.random() < 0.05:
-                        short_sleep(random.randint(8, 45))
-                    try:
-                        ok, status = self.watch_episode(
-                            ep,
-                            real_info or s,
-                            allow_repeat=True,
-                            nth_watch=nth,
-                        )
-                    except Exception:
-                        ok, status = False, "exception"
-                    if status == "skip":
-                        series_skip += 1
-                    elif ok:
-                        series_done += 1
-                        total_watched_all += 1
-                        watch_counts[key_pair] = nth
-                        any_series_progress = True
-                    else:
-                        series_fail += 1
+                except Exception:
+                    ok, status = False, "exception"
+                if status == "skip":
+                    series_skip += 1
+                elif ok:
+                    series_done += 1
+                    total_watched_all += 1
+                    watch_counts[key_pair] = 1
+                else:
+                    series_fail += 1
 
             total_skip_all += series_skip
             total_fail_all += series_fail
@@ -2459,7 +2560,7 @@ class MiniPixV2:
                     f"<b>🎬 WATCH (Series)</b> | User <code>{telegram_user_id}</code> | sid=<code>{series_id}</code>\n{msg[:1800]}"
                 )
 
-        log(f"🎯 Specific series mode: id={series_id}\nRewards/ep: 15→8→5→3→2→2→2→2 (total +39/ep)")
+        log(f"🎯 Specific series mode: id={series_id}\nReward/ep: +15 coins (1x max per ep)")
         cap_status = self.get_campaign_status()
         daily_used = cap_status.get("used", 0)
         daily_cap = cap_status.get("cap", 0)
@@ -2511,7 +2612,7 @@ class MiniPixV2:
         max_allowed = (
             max_watches
             if max_watches is not None
-            else MAX_WATCHES_PER_EP * max(1, len(episodes_sorted))
+            else max(1, len(episodes_sorted))
         )
 
         def _check_daily_cap(local):
@@ -2527,46 +2628,37 @@ class MiniPixV2:
                     return True
             return False
 
-        any_series_progress = True
-        loop_count = 0
         inner_ep_counter = 0
-        while any_series_progress:
-            loop_count += 1
-            any_series_progress = False
-            if loop_count > MAX_WATCHES_PER_EP + 1:
+        for ep in episodes_sorted:
+            inner_ep_counter += 1
+            if total_watched_all >= max_allowed:
+                log(f"🛑 Soft limit ({max_allowed} watches).")
                 break
-            for ep in episodes_sorted:
-                inner_ep_counter += 1
-                if total_watched_all >= max_allowed:
-                    log(f"🛑 Soft limit ({max_allowed} watches).")
-                    break
-                if _check_daily_cap(total_watched_all):
-                    break
-                ep_no = ep.get("episodeNo") or ep.get("episode_no") or 0
-                key_pair = (str(real_sid), str(ep_no))
-                cur_count = watch_counts.get(key_pair, 0)
-                if cur_count >= MAX_WATCHES_PER_EP:
-                    continue
-                nth = cur_count + 1
-                if inner_ep_counter > 1 and random.random() < 0.05:
-                    short_sleep(random.randint(8, 45))
-                try:
-                    ok, status = self.watch_episode(
-                        ep,
-                        real_info or {},
-                        allow_repeat=True,
-                        nth_watch=nth,
-                    )
-                except Exception:
-                    ok, status = False, "exception"
-                if status == "skip":
-                    total_skip += 1
-                elif ok:
-                    total_watched_all += 1
-                    watch_counts[key_pair] = nth
-                    any_series_progress = True
-                else:
-                    total_fail += 1
+            if _check_daily_cap(total_watched_all):
+                break
+            ep_no = ep.get("episodeNo") or ep.get("episode_no") or 0
+            key_pair = (str(real_sid), str(ep_no))
+            cur_count = watch_counts.get(key_pair, 0)
+            if cur_count >= 1:
+                continue
+            if inner_ep_counter > 1 and random.random() < 0.05:
+                short_sleep(random.randint(8, 45))
+            try:
+                ok, status = self.watch_episode(
+                    ep,
+                    real_info or {},
+                    allow_repeat=False,
+                    nth_watch=1,
+                )
+            except Exception:
+                ok, status = False, "exception"
+            if status == "skip":
+                total_skip += 1
+            elif ok:
+                total_watched_all += 1
+                watch_counts[key_pair] = 1
+            else:
+                total_fail += 1
 
         try:
             self.claim_reward_task(series_id=real_sid)
@@ -2647,15 +2739,14 @@ class MiniPixV2:
         counts = self.get_watch_counts_from_profile()
         key_pair = (str(real_sid), str(episode_no))
         cur_count = counts.get(key_pair, 0)
-        if cur_count >= MAX_WATCHES_PER_EP:
+        if cur_count >= 1:
             return {
-                "error": f"Episode already {MAX_WATCHES_PER_EP}x watched. No more reward."
+                "error": f"Episode already 1x watched. No more reward (repeat disabled)."
             }
-        nth = cur_count + 1
         bal_before = self.get_balance_silent()
         try:
             ok, status = self.watch_episode(
-                target, real_info or {}, allow_repeat=True, nth_watch=nth
+                target, real_info or {}, allow_repeat=False, nth_watch=1
             )
         except Exception as ee:
             ok, status = False, f"exception: {ee}"
@@ -2667,14 +2758,13 @@ class MiniPixV2:
         delta = None
         if bal_before is not None and bal_end is not None:
             delta = bal_end - bal_before
-        reward_label = _expected_reward(nth)
+        reward_label = 15
         log(
-            f"Result: ok={ok} status={status} nth={nth} (+{reward_label} expected) delta={delta}"
+            f"Result: ok={ok} status={status} (+{reward_label} expected) delta={delta}"
         )
         return {
             "ok": ok,
             "status": status,
-            "nth_watch": nth,
             "reward_expected": reward_label,
             "balance_before": bal_before,
             "balance_after": bal_end,
@@ -2710,27 +2800,60 @@ class MiniPixV2:
             pass
         return {"success": True, "dailyAttempts": {"exhausted": False}}
 
-    def quiz_start_session(self, force_fresh_device=False):
+    def _gen_integrity_stub(self):
+        import hashlib
+        raw = f"{self.device_id}:{self.user_id or 'u'}:{int(time.time())}:{random.random()}"
+        h = hashlib.sha256(raw.encode()).hexdigest()
+        return h + "." + hashlib.md5(raw[::-1].encode()).hexdigest()
+
+    def quiz_start_session(self, force_fresh_device=False, hint_hard_ban=False):
+        self._session_active = True
         try:
             if force_fresh_device:
-                self.refresh_session_fingerprint(full=True)
-            elif random.random() < 0.35:
-                self._rotate_headers(full=False)
+                try:
+                    self._refresh_auth_state(full=True, with_quiz_status=True)
+                except Exception:
+                    try:
+                        self.refresh_session_fingerprint(full=True)
+                    except Exception:
+                        pass
+                medium_sleep(random.randint(400, 900))
+            else:
+                r = random.random()
+                if hint_hard_ban or r < 0.55:
+                    try:
+                        self._refresh_auth_state(full=(hint_hard_ban or r < 0.25), with_quiz_status=False)
+                    except Exception:
+                        try:
+                            self.refresh_session_fingerprint(full=(hint_hard_ban or r < 0.25))
+                        except Exception:
+                            pass
+                medium_sleep(random.randint(180, 550))
         except Exception:
             pass
-        extra_hdrs = {
-            "content-type": "application/json; charset=utf-8",
-            "x-device-id": self.device_id,
-            "x-device-info": self.device_info[:80],
-            "accept": "application/json, text/plain, */*",
-            "origin": "https://mixpix.app",
-            "referer": "https://mixpix.app/",
-        }
+        try:
+            sc1, raw1 = self._req("GET", "/users/me", timeout=8)
+            if sc1 == 200 and isinstance(raw1, dict):
+                uid = raw1.get("_id") or raw1.get("id") or raw1.get("userId")
+                if uid and not self.user_id:
+                    self.user_id = uid
+                pid = raw1.get("master_profile") or raw1.get("masterProfile")
+                if pid and not self.profile_id:
+                    self.profile_id = pid
+        except Exception:
+            pass
+        try:
+            self.open_app()
+        except Exception:
+            pass
         sc, data = self._req(
             "POST",
             "/quiz/session/start",
-            headers=extra_hdrs,
-            data=json.dumps({}).encode("utf-8"),
+            headers={
+                "content-type": "application/json; charset=utf-8",
+                "x-minipix-integrity-error": "ERR_-8",
+            },
+            data=b"",
         )
         send_log_sync(
             f"📡 quiz/session/start response:\n"
@@ -2746,6 +2869,7 @@ class MiniPixV2:
             "has_session": False,
             "has_question": False,
             "message": None,
+            "hard_ban": False,
         }
         if sc == 200 and isinstance(data, dict):
             diag["success"] = (data.get("success") is True or data.get("status") == "success")
@@ -2753,6 +2877,8 @@ class MiniPixV2:
                 diag["enabled"] = bool(data.get("enabled"))
                 if diag["enabled"] is False:
                     diag["disabled_flag"] = True
+                    if not (data.get("session") or data.get("question") or data.get("sessionId")):
+                        diag["hard_ban"] = True
             msg = data.get("message") or data.get("error") or data.get("msg")
             if msg:
                 diag["message"] = str(msg)
@@ -2781,7 +2907,8 @@ class MiniPixV2:
                         send_log_sync(
                             f"🚫 QUIZ BANNED SIGNAL: enabled=false (fingerprint flagged)\n"
                             f"sid={sid}, question_obj={question_obj is not None}\n"
-                            f"msg={diag.get('message')}"
+                            f"msg={diag.get('message')}\n"
+                            f"hard_ban={diag.get('hard_ban')}"
                         )
                     else:
                         send_log_sync(
@@ -2792,7 +2919,7 @@ class MiniPixV2:
             else:
                 if diag["enabled"] is False:
                     send_log_sync(
-                        f"🚫 QUIZ BANNED: success=False AND enabled=false. msg={diag.get('message')}"
+                        f"🚫 QUIZ BANNED: success=False AND enabled=false. msg={diag.get('message')} hard_ban={diag.get('hard_ban')}"
                     )
                 else:
                     send_log_sync(
@@ -2800,6 +2927,7 @@ class MiniPixV2:
                     )
         else:
             send_log_sync(f"❌ Quiz start HTTP {sc}: {str(data)[:300]}")
+        self._session_active = False
         return None, None, None, diag
 
     def quiz_submit_answer(self, session_id, question_id, chosen_index, extra_headers=None):
@@ -2810,8 +2938,6 @@ class MiniPixV2:
         }
         hdrs = {
             "content-type": "application/json; charset=utf-8",
-            "x-device-id": self.device_id,
-            "x-device-info": self.device_info[:80],
         }
         if isinstance(extra_headers, dict):
             hdrs.update(extra_headers)
@@ -2832,11 +2958,6 @@ class MiniPixV2:
         payload = {"sessionId": session_id, "questionId": question_id}
         hdrs = {
             "content-type": "application/json; charset=utf-8",
-            "x-device-id": self.device_id,
-            "x-device-info": self.device_info[:80],
-            "accept": "application/json, text/plain, */*",
-            "origin": "https://mixpix.app",
-            "referer": "https://mixpix.app/",
         }
         if isinstance(extra_headers, dict):
             hdrs.update(extra_headers)
@@ -2850,26 +2971,87 @@ class MiniPixV2:
             return data.get("removedOptions", [])
         return None
 
-    def quiz_ad_ack(self, session_id, extra_headers=None):
+    def quiz_ad_ack(self, session_id, extra_headers=None, raw_log_prefix=None, pre_hint_ban=False):
+        if pre_hint_ban:
+            if raw_log_prefix:
+                send_log_sync(f"🩺 {raw_log_prefix} pre_hint_ban=True (answer-level enabled=false) → SKIP all ad-ack probes entirely.")
+            return None
         payload = {"sessionId": session_id}
         hdrs = {
             "content-type": "application/json; charset=utf-8",
-            "x-device-id": self.device_id,
-            "x-device-info": self.device_info[:80],
-            "accept": "application/json, text/plain, */*",
-            "origin": "https://mixpix.app",
-            "referer": "https://mixpix.app/",
         }
         if isinstance(extra_headers, dict):
             hdrs.update(extra_headers)
-        sc, data = self._req(
-            "POST",
-            "/quiz/session/ad-ack",
-            headers=hdrs,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-        if sc == 200 and isinstance(data, dict) and data.get("success"):
-            return data.get("question")
+        endpoints = [
+            ("POST", "/quiz/session/ad-ack", payload, dict(hdrs)),
+            ("POST", "/quiz/session/continue", payload, dict(hdrs)),
+            ("GET", f"/quiz/session/{session_id}", None, dict(hdrs)),
+        ]
+        probe1_enabled_false = False
+        probe2_404 = False
+        for idx, (method, path, body, cur_hdrs) in enumerate(endpoints):
+            if probe1_enabled_false and idx >= 1:
+                break
+            if probe1_enabled_false and probe2_404:
+                break
+            try:
+                kwargs = {"headers": cur_hdrs, "timeout": 15}
+                if body is not None:
+                    kwargs["data"] = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                sc, data = self._req(method, path, **kwargs)
+                if raw_log_prefix:
+                    send_log_sync(
+                        f"🩺 {raw_log_prefix} ad-ack probe#{idx+1} {method} {path.split('?')[0]}\n"
+                        f"Status: {sc}\n"
+                        f"Data: {json.dumps(data, ensure_ascii=False)[:600] if isinstance(data,(dict,list)) else str(data)[:400]}"
+                    )
+                if idx == 0 and sc == 200 and isinstance(data, dict) and data.get("enabled") is False:
+                    probe1_enabled_false = True
+                if idx == 1 and sc == 404:
+                    probe2_404 = True
+                    if probe1_enabled_false:
+                        if raw_log_prefix:
+                            send_log_sync(f"🩺 {raw_log_prefix} enabled=false pattern probe1=200/ef + probe2=404 → CANCEL all remaining probes (idx≥2)")
+                        break
+                if sc == 404 and idx >= 2 and probe1_enabled_false:
+                    continue
+                is_ok = (sc == 200 and isinstance(data, dict))
+                if not is_ok:
+                    continue
+                q = None
+                for candidate in (
+                    data.get("question"),
+                    (data.get("data") or {}).get("question") if isinstance(data.get("data"), dict) else None,
+                    (data.get("next") or {}).get("question") if isinstance(data.get("next"), dict) else None,
+                    data.get("next") if isinstance(data.get("next"), dict) and data.get("next").get("questionId") else None,
+                    data.get("nextQuestion"),
+                    (data.get("result") or {}).get("question") if isinstance(data.get("result"), dict) else None,
+                ):
+                    if isinstance(candidate, dict) and (
+                        candidate.get("questionId")
+                        or candidate.get("options")
+                        or candidate.get("questionHi")
+                        or candidate.get("questionEn")
+                    ):
+                        q = candidate
+                        break
+                    elif isinstance(candidate, dict):
+                        q = candidate
+                        break
+                if q:
+                    return q
+                if data.get("success") is True and (data.get("hearts") is not None or data.get("coinsSoFar") is not None):
+                    if not q:
+                        for candidate in (
+                            data.get("next"),
+                            data.get("data"),
+                        ):
+                            if isinstance(candidate, dict):
+                                sub = candidate.get("question")
+                                if isinstance(sub, dict) and (sub.get("questionId") or sub.get("options")):
+                                    return sub
+            except Exception:
+                continue
         return None
 
     def _build_quiz_prompt(self, question, options):
@@ -3059,7 +3241,19 @@ class MiniPixV2:
         question_delay=QUIZ_QUESTION_DELAY,
         progress_callback=None,
         telegram_user_id=None,
+        max_questions_per_session=None,
+        max_total_questions=None,
     ):
+        single_session_mode = (max_sessions == 1 and max_questions_per_session is None and max_total_questions is None)
+        if single_session_mode and progress_callback:
+            try:
+                progress_callback(
+                    f"✅ Mode: EXACTLY 1 SESSION per Run Quiz click.\n"
+                    f"Next session ke liye fir se '🤖 Run Quiz' dabao.\n"
+                    f"(Saves daily login limit, prevents session limit waste)"
+                )
+            except Exception:
+                pass
         def log(msg):
             if progress_callback:
                 try:
@@ -3090,46 +3284,171 @@ class MiniPixV2:
         )
 
         last_diag = None
+        consec_ban_count = 0
+        token_relogin_done_this_run = 0
+        MAX_TOKEN_RELOGINS_PER_RUN = 2
         for session_num in range(1, max_sessions + 1):
             log(f"--- Session {session_num}/{max_sessions} ---")
 
+            prev_hard_ban = bool(isinstance(last_diag, dict) and last_diag.get("hard_ban"))
+            prev_any_ban = bool(isinstance(last_diag, dict) and last_diag.get("disabled_flag"))
+            if prev_any_ban:
+                consec_ban_count += 1
+            else:
+                consec_ban_count = 0
+
             try:
-                do_full = (session_num % 2 == 0) or (failed_attempts >= 1)
-                if isinstance(last_diag, dict) and last_diag.get("disabled_flag"):
+                do_full = (session_num % 2 == 0) or (failed_attempts >= 1) or (consec_ban_count >= 1)
+                if prev_hard_ban or consec_ban_count >= 2:
                     do_full = True
                 if session_num > 1:
                     self._refresh_auth_state(full=do_full, with_quiz_status=True)
-                    medium_sleep(random.randint(500, 1400))
+                    medium_sleep(random.randint(600, 1800))
+                    if prev_hard_ban:
+                        pcool = random.uniform(15.0, 40.0)
+                        log(f"🛑 Previous session had HARD BAN → pre-session cool-off {pcool:.1f}s...")
+                        send_log_sync(f"🧊 Pre-session {session_num}: hard-ban cool-off {pcool:.1f}s (consec bans={consec_ban_count}).")
+                        time.sleep(pcool)
+                    elif prev_any_ban and consec_ban_count >= 1:
+                        pcool = random.uniform(6.0, 20.0)
+                        log(f"🛑 Previous session had BAN → pre-session cool-off {pcool:.1f}s...")
+                        time.sleep(pcool)
             except Exception:
                 try:
                     if session_num > 1:
-                        do_full_fb = (session_num % 2 == 0) or (failed_attempts >= 1)
+                        do_full_fb = (session_num % 2 == 0) or (failed_attempts >= 1) or (consec_ban_count >= 1)
                         self.refresh_session_fingerprint(full=do_full_fb)
-                        medium_sleep(random.randint(300, 900))
+                        medium_sleep(random.randint(400, 1100))
+                        if prev_hard_ban:
+                            pcool = random.uniform(15.0, 35.0)
+                            time.sleep(pcool)
+                        elif prev_any_ban:
+                            pcool = random.uniform(6.0, 18.0)
+                            time.sleep(pcool)
                 except Exception:
                     pass
 
             session_id, question_obj, session_meta, diag = None, None, None, None
             ban_detected_any = False
-            for attempt in range(3):
-                if attempt == 1:
-                    prev_ban = bool(isinstance(diag, dict) and diag.get("disabled_flag"))
-                    ban_detected_any = ban_detected_any or prev_ban
-                    if prev_ban:
-                        log(f"🚫 Attempt 2/3: BAN detected → FULL refresh + longer cool-off...")
-                        send_log_sync(f"🧨 Session {session_num} a1 BANNED (enabled=false) → FULL auth-state refresh.")
+            hard_ban_detected = False
+
+            attempt_1_diag = None
+            for slot in (1, 2):
+                force = False
+                hint_ban = bool(prev_any_ban and consec_ban_count >= 1)
+                if slot == 1:
+                    if hint_ban:
                         try:
-                            self._refresh_auth_state(full=True, with_quiz_status=True)
+                            self._refresh_auth_state(full=(consec_ban_count >= 2), with_quiz_status=False)
+                            medium_sleep(random.randint(300, 800))
                         except Exception:
+                            pass
+                else:
+                    disabled_after_first = bool(isinstance(attempt_1_diag, dict) and attempt_1_diag.get("disabled_flag"))
+                    hard_after_first = bool(isinstance(attempt_1_diag, dict) and attempt_1_diag.get("hard_ban"))
+                    exhausted_after_first = bool(isinstance(attempt_1_diag, dict) and attempt_1_diag.get("exhausted"))
+                    if exhausted_after_first:
+                        log("🛑 Daily exhausted from first attempt — skip retry, no second start-session attempt.")
+                        diag = attempt_1_diag
+                        break
+                    if disabled_after_first and token_relogin_done_this_run < MAX_TOKEN_RELOGINS_PER_RUN:
+                        log(f"🔑 First attempt got enabled=false → AUTO TOKEN RE-LOGIN (slot 2, attempt to reset ban...")
+                        relogin_ok = False
+                        try:
+                            relogin_ok = self._token_relogin_full_reset(progress_log_fn=log)
+                        except Exception as re:
+                            log(f"⚠️  Token relogin exception: {re}")
+                            relogin_ok = False
+                        if relogin_ok:
+                            token_relogin_done_this_run += 1
+                            pcool = random.uniform(20.0, 45.0)
+                            log(f"   Token re-login complete → cool-off {pcool:.1f}s before session start...")
+                            send_log_sync(f"✅ TOKEN RE-LOGIN OK slot {token_relogin_done_this_run}/{MAX_TOKEN_RELOGINS_PER_RUN} — cool-off {pcool:.1f}s then start session.")
+                            time.sleep(pcool)
+                        else:
                             try:
-                                self.refresh_session_fingerprint(full=True)
+                                self._refresh_auth_state(full=True, with_quiz_status=True)
                             except Exception:
-                                pass
-                        cool_min, cool_max = (12.0, 28.0) if prev_ban else (5.0, 12.0)
-                        time.sleep(random.uniform(cool_min, cool_max))
+                                try:
+                                    self.refresh_session_fingerprint(full=True)
+                                except Exception:
+                                    pass
+                            pcool = random.uniform(15.0, 35.0)
+                            time.sleep(pcool)
                         force = True
+                        hint_ban = True
+                        if hard_after_first:
+                            time.sleep(random.uniform(10.0, 20.0))
+                    elif disabled_after_first:
+                        log(f"🚫 enabled=false again — token relogin used {token_relogin_done_this_run}/{MAX_TOKEN_RELOGINS_PER_RUN}.")
+                        not_exhausted_ctx = True
+                        try:
+                            qs_ctx = self.get_quiz_status() or {}
+                            daily_ctx = qs_ctx.get("dailyAttempts", {}) or {}
+                            if daily_ctx.get("exhausted"):
+                                not_exhausted_ctx = False
+                        except Exception:
+                            pass
+                        if not_exhausted_ctx:
+                            send_log_sync(
+                                f"⏳ S{session_num} slot-2: Token relogin limit reached BUT daily NOT exhausted → TEMP BAN LIFT WAIT CYCLE (hard_ban={hard_after_first}).\n"
+                                f"Will wait+retry up to 3 times to catch the ~2min temp-ban window observed today 12:56→13:01."
+                            )
+                            temp_wait_success = False
+                            TEMP_BAN_RETRIES = 3
+                            for tbi in range(TEMP_BAN_RETRIES):
+                                if hard_after_first:
+                                    t_wait = random.uniform(90.0, 150.0)
+                                else:
+                                    t_wait = random.uniform(55.0, 100.0)
+                                log(f"   Temp-ban wait #{tbi+1}/{TEMP_BAN_RETRIES}: {t_wait:.1f}s ...")
+                                send_log_sync(f"⏳ S{session_num} Temp-Ban-Wait #{tbi+1}/{TEMP_BAN_RETRIES}: {t_wait:.0f}s (hard={hard_after_first})")
+                                time.sleep(t_wait)
+                                try:
+                                    if (tbi % 2) == 1:
+                                        self._refresh_auth_state(full=True, with_quiz_status=True)
+                                    else:
+                                        self.refresh_session_fingerprint(full=True)
+                                except Exception:
+                                    pass
+                                medium_sleep(random.randint(300, 900))
+                                tcur_diag = None
+                                try:
+                                    tres = self.quiz_start_session(force_fresh_device=True, hint_hard_ban=hard_after_first)
+                                    if isinstance(tres, tuple) and len(tres) >= 4:
+                                        ta, tb, tc, td = tres[0], tres[1], tres[2], tres[3]
+                                    elif isinstance(tres, tuple) and len(tres) == 3:
+                                        ta, tb, tc = tres
+                                        td = {}
+                                    else:
+                                        ta, tb, tc, td = None, None, None, {}
+                                except Exception as etr:
+                                    ta, tb, tc, td = None, None, None, {"exception": str(etr)}
+                                tcur_diag = td
+                                if isinstance(td, dict):
+                                    if td.get("exhausted"):
+                                        log("🛑 During temp-ban wait: exhausted detected → abort.")
+                                        failed_attempts = 9
+                                        diag = td
+                                        break
+                                    if td.get("disabled_flag"):
+                                        ban_detected_any = True
+                                        if td.get("hard_ban"):
+                                            hard_ban_detected = True
+                                if ta and tb:
+                                    session_id, question_obj, session_meta, diag = ta, tb, tc, td
+                                    temp_wait_success = True
+                                    send_log_sync(f"✅ S{session_num}: Temp ban lifted after {(tbi+1)} wait cycles → session started.")
+                                    break
+                            if temp_wait_success:
+                                break
+                            if failed_attempts >= 9:
+                                break
+                        diag = attempt_1_diag
+                        log(f"🚫 enabled=false — temp-ban wait cycles exhausted / token relogin cap hit → stop session_num {session_num}.")
+                        break
                     else:
-                        log(f"🔄 Session start attempt {attempt+1}/3: Light refresh + wait...")
+                        log(f"🔄 Retry session start (slot 2/2) — first attempt failed without ban, light cool-off...")
                         try:
                             self._refresh_auth_state(full=False, with_quiz_status=False)
                         except Exception:
@@ -3138,68 +3457,53 @@ class MiniPixV2:
                             except Exception:
                                 pass
                         time.sleep(random.uniform(5.0, 12.0))
-                        force = False
-                elif attempt == 2:
-                    prev_ban = bool(isinstance(diag, dict) and diag.get("disabled_flag"))
-                    ban_detected_any = ban_detected_any or prev_ban
-                    log(f"🔥 Session start attempt {attempt+1}/3: FULL DEVICE RESET + long wait...")
-                    send_log_sync(
-                        f"🧨 Session {session_num} start failed twice ({'BAN=ENABLED_FALSE' if prev_ban or ban_detected_any else 'normal-fail'}) → FULL reset."
-                    )
-                    try:
-                        self._refresh_auth_state(full=True, with_quiz_status=True)
-                    except Exception:
-                        try:
-                            self.refresh_session_fingerprint(full=True)
-                        except Exception:
-                            pass
-                    try:
-                        self.get_user()
-                    except Exception:
-                        pass
-                    extra = 8.0 if (prev_ban or ban_detected_any) else 0.0
-                    time.sleep(random.uniform(14.0 + extra, 32.0 + extra))
-                    force = True
-                else:
-                    force = False
 
-                diag = None
                 try:
-                    res = self.quiz_start_session(force_fresh_device=force)
+                    if isinstance(diag, dict) and diag.get("disabled_flag"):
+                        pass
+                except Exception:
+                    pass
+                cur_diag_out = None
+                try:
+                    res = self.quiz_start_session(force_fresh_device=force, hint_hard_ban=hint_ban)
                     if isinstance(res, tuple) and len(res) >= 4:
-                        session_id, question_obj, session_meta, diag = res[0], res[1], res[2], res[3]
+                        session_id, question_obj, session_meta, cur_diag_out = res[0], res[1], res[2], res[3]
                     elif isinstance(res, tuple) and len(res) == 3:
                         session_id, question_obj, session_meta = res
-                        diag = {}
+                        cur_diag_out = {}
                     else:
                         session_id, question_obj, session_meta = None, None, None
-                        diag = {}
+                        cur_diag_out = {}
                 except Exception as e:
-                    session_id, question_obj, session_meta, diag = None, None, None, {"exception": str(e)}
-
-                if isinstance(diag, dict) and diag.get("disabled_flag"):
+                    session_id, question_obj, session_meta, cur_diag_out = None, None, None, {"exception": str(e)}
+                diag = cur_diag_out
+                if slot == 1:
+                    attempt_1_diag = cur_diag_out
+                if isinstance(cur_diag_out, dict) and cur_diag_out.get("disabled_flag"):
                     ban_detected_any = True
-
+                    if cur_diag_out.get("hard_ban"):
+                        hard_ban_detected = True
                 if session_id and question_obj:
-                    if attempt > 0:
-                        send_log_sync(f"✅ Session {session_num} recovered on attempt {attempt+1}" + (" (after BAN cool-off)" if ban_detected_any else ""))
                     break
-                if attempt < 2:
-                    try:
-                        if isinstance(diag, dict) and diag.get("exhausted"):
-                            log("🛑 Daily exhausted (from start response) — abort further sessions.")
-                            failed_attempts = 9
-                            break
-                        qs = self.get_quiz_status() or {}
-                        daily_info = qs.get("dailyAttempts", {}) or {}
-                        if daily_info.get("exhausted"):
-                            log("🛑 Daily quiz exhausted — abort further sessions.")
-                            failed_attempts = 9
-                            break
-                    except Exception:
-                        pass
+                try:
+                    if isinstance(cur_diag_out, dict) and cur_diag_out.get("exhausted"):
+                        log("🛑 Daily exhausted (from start response) — abort further sessions.")
+                        failed_attempts = 9
+                        break
+                    qs = self.get_quiz_status() or {}
+                    daily_info = qs.get("dailyAttempts", {}) or {}
+                    if daily_info.get("exhausted"):
+                        log("🛑 Daily quiz exhausted — abort further sessions.")
+                        failed_attempts = 9
+                        break
+                except Exception:
+                    pass
 
             last_diag = diag if isinstance(diag, dict) else None
+            if isinstance(last_diag, dict) and not last_diag.get("disabled_flag") and session_id and question_obj:
+                pass
+            elif ban_detected_any and not (session_id and question_obj):
+                pass
 
             if failed_attempts >= 9:
                 break
@@ -3210,6 +3514,8 @@ class MiniPixV2:
                     parts = []
                     if diag.get("disabled_flag"):
                         parts.append("ENABLED_FALSE=BAN")
+                    if diag.get("hard_ban"):
+                        parts.append("HARD_BAN")
                     if diag.get("exhausted"):
                         parts.append("EXHAUSTED")
                     if diag.get("message"):
@@ -3217,10 +3523,11 @@ class MiniPixV2:
                     if diag.get("status_code"):
                         parts.append(f"http={diag.get('status_code')}")
                     diag_repr = " | ".join(parts)
-                log("❌ Failed to start session after 3 retries" + (f" [{diag_repr}]" if diag_repr else ""))
+                log(f"❌ Failed to start session (no retries beyond 2 slot attempts (save daily 3 cap)" + (f" [{diag_repr}]" if diag_repr else ""))
                 send_log_sync(
-                    f"❌ Session {session_num} start FAILED × 3 | User <code>{telegram_user_id}</code>"
+                    f"❌ Session {session_num} start FAILED (MAX 2 SLOT ONLY, NO MORE — saves daily cap) | User <code>{telegram_user_id}</code>"
                     + (f"\n  Diagnosis: {diag_repr}" if diag_repr else "")
+                    + (f"\n  consec_ban_count={consec_ban_count}" if consec_ban_count else "")
                 )
                 failed_attempts += 1
                 if failed_attempts >= 2:
@@ -3233,9 +3540,18 @@ class MiniPixV2:
                         self.refresh_session_fingerprint(full=True)
                     except Exception:
                         pass
-                base_sleep_min = 12.0 if ban_detected_any else 8.0
-                base_sleep_max = 30.0 if ban_detected_any else 20.0
-                time.sleep(random.uniform(base_sleep_min, base_sleep_max))
+                if hard_ban_detected or (isinstance(diag, dict) and diag.get("hard_ban")):
+                    base_sleep_min = 40.0
+                    base_sleep_max = 90.0
+                elif ban_detected_any:
+                    base_sleep_min = 25.0
+                    base_sleep_max = 60.0
+                else:
+                    base_sleep_min = 12.0
+                    base_sleep_max = 30.0
+                sleep_s = random.uniform(base_sleep_min, base_sleep_max)
+                log(f"   Fail cool-off before next try: {sleep_s:.1f}s")
+                time.sleep(sleep_s)
                 continue
 
             hearts = session_meta.get("hearts", 3) if session_meta else 3
@@ -3246,13 +3562,14 @@ class MiniPixV2:
                 if failed_attempts >= 2:
                     log("Aborting: repeated dead sessions.")
                     break
-                time.sleep(random.uniform(5.0, 12.0))
+                time.sleep(random.uniform(6.0, 15.0))
                 continue
 
             failed_attempts = 0
             ad_every = session_meta.get("adGateEvery", 5) if session_meta else 5
             q_count = 0
             session_coins = 0
+            session_coins_max = 0
             correct_count = 0
             wrong_count = 0
 
@@ -3272,6 +3589,16 @@ class MiniPixV2:
 
                 q_count += 1
                 total_question_count += 1
+                
+                if max_questions_per_session is not None and q_count > max_questions_per_session:
+                    log(f"🎯 Quiz level target hit: {max_questions_per_session} questions per session. Stop session.")
+                    break
+                
+                if max_total_questions is not None and total_question_count > max_total_questions:
+                    log(f"🎯 Total questions target hit: {max_total_questions}. Stop all sessions.")
+                    failed_attempts = 9
+                    break
+                
                 key_index = 0 if key_count <= 1 else ((total_question_count - 1) % key_count)
                 combined = q_text_hi
                 if q_text_en and q_text_en != q_text_hi:
@@ -3316,10 +3643,6 @@ class MiniPixV2:
                 try:
                     q_extra_hdrs = {
                         "x-device-id": self.device_id,
-                        "x-device-info": self.device_info[:80],
-                        "accept": "application/json, text/plain, */*",
-                        "origin": "https://mixpix.app",
-                        "referer": "https://mixpix.app/",
                     }
                     result = self.quiz_submit_answer_with_headers(
                         session_id, q_id, correct_index, q_extra_hdrs
@@ -3334,18 +3657,49 @@ class MiniPixV2:
                 if not result:
                     break
 
-                if result.get("success"):
-                    correct_flag = result.get("correct", False)
-                    coins_earned = int(result.get("coinsEarned") or 0)
-                    session_coins = result.get("coinsSoFar", 0)
-                    hearts = int(result.get("hearts", hearts))
-                    total_coins += coins_earned
-                    if correct_flag:
-                        correct_count += 1
-                    else:
-                        wrong_count += 1
+                mid_session_enabled_false = False
+                if isinstance(result, dict) and result.get("enabled") is False:
+                    mid_session_enabled_false = True
 
-                    status_emoji = "✅" if correct_flag else "❌"
+                if result.get("success") or mid_session_enabled_false:
+                    correct_flag = result.get("correct", False) if not mid_session_enabled_false else False
+                    coins_earned_raw = result.get("coinsEarned")
+                    try:
+                        coins_earned = int(coins_earned_raw) if coins_earned_raw not in (None, "") else 0
+                    except Exception:
+                        coins_earned = 0
+                    try:
+                        coins_so_far_raw = result.get("coinsSoFar")
+                        if coins_so_far_raw is None or str(coins_so_far_raw).strip() == "":
+                            new_so_far = None
+                        else:
+                            new_so_far = int(coins_so_far_raw)
+                    except Exception:
+                        new_so_far = None
+                    if isinstance(new_so_far, int):
+                        if new_so_far >= session_coins_max:
+                            session_coins = new_so_far
+                            session_coins_max = new_so_far
+                        else:
+                            session_coins = session_coins_max
+                    else:
+                        session_coins = session_coins_max
+                    try:
+                        h_raw = result.get("hearts")
+                        if h_raw is None or str(h_raw).strip() == "":
+                            pass
+                        else:
+                            hearts = int(h_raw)
+                    except Exception:
+                        pass
+                    total_coins += coins_earned
+                    if not mid_session_enabled_false:
+                        if correct_flag:
+                            correct_count += 1
+                        else:
+                            wrong_count += 1
+
+                    status_emoji = "✅" if (correct_flag and not mid_session_enabled_false) else ("🚫" if mid_session_enabled_false else "❌")
                     correct_idx_server = result.get("correctIndex")
                     correct_server_text = ""
                     if correct_idx_server is not None:
@@ -3353,11 +3707,74 @@ class MiniPixV2:
                             correct_server_text = f" (Correct: {correct_idx_server} '{options[correct_idx_server]}')"
                         except Exception:
                             pass
+                    
+                    if correct_idx_server is not None and isinstance(correct_idx_server, int) and 0 <= correct_idx_server < len(options):
+                        try:
+                            qhash_srv = _quiz_cache_key(combined, options)
+                            col_srv = _mongo_cache_col()
+                            if col_srv is not None:
+                                correct_text_srv = options[correct_idx_server]
+                                ai_was_wrong = False
+                                try:
+                                    if ai_choice_idx is not None and ai_choice_idx != correct_idx_server:
+                                        ai_was_wrong = True
+                                except Exception:
+                                    pass
+                                quiz_level_val = 1
+                                try:
+                                    quiz_level_val = int(getattr(self, "_session_quiz_level", 1) or 1)
+                                except Exception:
+                                    quiz_level_val = 1
+                                set_doc_srv = {
+                                    "question": combined,
+                                    "options": list(options or []),
+                                    "correct_index": correct_idx_server,
+                                    "correct_text": correct_text_srv,
+                                    "model_used": "server_ground_truth",
+                                    "server_confirmed_at": datetime.utcnow().isoformat(),
+                                    "quiz_level": quiz_level_val,
+                                    "ai_was_wrong": ai_was_wrong,
+                                }
+                                try:
+                                    if ai_was_wrong:
+                                        set_doc_srv["ai_corrected"] = True
+                                        set_doc_srv["ai_prev_wrong_index"] = ai_choice_idx
+                                    update_spec = {"$set": set_doc_srv, "$setOnInsert": {"hits": 0, "ai_corrections": 0}}
+                                    result = col_srv.update_one({"qhash": qhash_srv}, update_spec, upsert=True)
+                                    if result.matched_count > 0 and ai_was_wrong:
+                                        try:
+                                            col_srv.update_one({"qhash": qhash_srv}, {"$inc": {"ai_corrections": 1}})
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    try:
+                                        doc_srv_fallback_set = {
+                                            "qhash": qhash_srv,
+                                            "question": combined,
+                                            "options": list(options or []),
+                                            "correct_index": correct_idx_server,
+                                            "correct_text": correct_text_srv,
+                                            "model_used": "server_ground_truth",
+                                            "solved_at": datetime.utcnow().isoformat(),
+                                            "ai_corrected": ai_was_wrong,
+                                            "ai_was_wrong": ai_was_wrong,
+                                            "quiz_level": quiz_level_val,
+                                        }
+                                        if ai_was_wrong:
+                                            doc_srv_fallback_set["ai_prev_wrong_index"] = ai_choice_idx
+                                        fallback_spec = {"$set": doc_srv_fallback_set, "$setOnInsert": {"hits": 0, "ai_corrections": 0}}
+                                        col_srv.update_one({"qhash": qhash_srv}, fallback_spec, upsert=True)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    
                     debug_line = (
                         f"Q{q_idx+1}/{q_total}: {status_emoji} | "
                         f"Key: {key_index+1}/{key_count} | Model: {model_used} | Raw: '{raw_answer[:30]}' | "
                         f"Chose: [{correct_index}] {chosen_text}{correct_server_text} | "
-                        f"+{coins_earned}¢ | hearts {hearts}"
+                        f"+{coins_earned}¢ | hearts {hearts} | sessionCoins {session_coins}"
+                        + (" | MID-BAN enabled=false" if mid_session_enabled_false else "")
                     )
                     send_log_sync(f"<b>{debug_line}</b>")
                     debug_lines.append(debug_line)
@@ -3367,48 +3784,282 @@ class MiniPixV2:
                     user_debug = "\n".join(debug_lines)
                     log(f"--- Quiz running ---\n{user_debug}")
 
-                    next_info = result.get("next")
-                    if not next_info:
-                        log(f"Session complete • {session_coins} coins")
+                    if mid_session_enabled_false:
+                        send_log_sync(
+                            f"🚨 MID-SESSION BAN detected at Q{q_idx+1} S{session_num} (enabled=false in /answer response).\n"
+                            f"Attempting TOKEN RE-LOGIN + fresh session start to finish remaining quota."
+                        )
+                        log(f"🚨 MID-SESSION enabled=false → token relogin + session restart path")
+                        prev_total_coins = total_coins
+                        prev_correct_count = correct_count
+                        prev_wrong_count = wrong_count
+                        prev_q_count = q_count
+                        prev_tqc = total_question_count
+                        try:
+                            relogin_ok = self._token_relogin_full_reset(progress_log_fn=log)
+                        except Exception as e:
+                            log(f"⚠️ mid-session token relogin exception: {e}")
+                            relogin_ok = False
+                        if not relogin_ok:
+                            try:
+                                self._refresh_auth_state(full=True, with_quiz_status=True)
+                            except Exception:
+                                try:
+                                    self.refresh_session_fingerprint(full=True)
+                                except Exception:
+                                    pass
+                        pcool_mid = random.uniform(30.0, 60.0)
+                        log(f"   Mid-ban cool-off {pcool_mid:.1f}s before new session start...")
+                        time.sleep(pcool_mid)
+
+                        mid_attempt_1_diag = None
+                        mid_new_sid = None
+                        mid_new_q = None
+                        mid_new_meta = None
+                        mid_diag_out = None
+                        for mid_slot in (1, 2):
+                            force_mid = (mid_slot == 2)
+                            hint_ban_mid = True
+                            if mid_slot == 2:
+                                disabled_first = bool(isinstance(mid_attempt_1_diag, dict) and mid_attempt_1_diag.get("disabled_flag"))
+                                exhausted_first = bool(isinstance(mid_attempt_1_diag, dict) and mid_attempt_1_diag.get("exhausted"))
+                                if exhausted_first:
+                                    log("🛑 mid-restart: exhausted at slot 1 — skip slot 2.")
+                                    break
+                                if disabled_first:
+                                    try:
+                                        self._refresh_auth_state(full=True, with_quiz_status=True)
+                                    except Exception:
+                                        try:
+                                            self.refresh_session_fingerprint(full=True)
+                                        except Exception:
+                                            pass
+                                    time.sleep(random.uniform(15.0, 35.0))
+                            try:
+                                mid_res = self.quiz_start_session(force_fresh_device=force_mid, hint_hard_ban=hint_ban_mid)
+                                if isinstance(mid_res, tuple) and len(mid_res) >= 4:
+                                    a, b, c, d = mid_res[0], mid_res[1], mid_res[2], mid_res[3]
+                                elif isinstance(mid_res, tuple) and len(mid_res) == 3:
+                                    a, b, c = mid_res
+                                    d = {}
+                                else:
+                                    a, b, c, d = None, None, None, {}
+                            except Exception as em:
+                                a, b, c, d = None, None, None, {"exception": str(em)}
+                            if mid_slot == 1:
+                                mid_attempt_1_diag = d
+                            mid_new_sid, mid_new_q, mid_new_meta, mid_diag_out = a, b, c, d
+                            if mid_new_sid and mid_new_q:
+                                break
+                            try:
+                                if isinstance(d, dict) and d.get("exhausted"):
+                                    failed_attempts = 9
+                                    break
+                                qs_mid = self.get_quiz_status() or {}
+                                daily_mid = qs_mid.get("dailyAttempts", {}) or {}
+                                if daily_mid.get("exhausted"):
+                                    failed_attempts = 9
+                                    break
+                            except Exception:
+                                pass
+                        if failed_attempts >= 9 or (not (mid_new_sid and mid_new_q)):
+                            log(f"❌ mid-session restart failed. Carrying totals to outer session summary (stop here).")
+                            last_diag = mid_diag_out if isinstance(mid_diag_out, dict) else None
+                            consec_ban_count += 1
+                            if not last_diag:
+                                last_diag = {"disabled_flag": True, "hard_ban": True}
+                            elif not last_diag.get("disabled_flag"):
+                                last_diag["disabled_flag"] = True
+                            total_coins = prev_total_coins
+                            correct_count = prev_correct_count
+                            wrong_count = prev_wrong_count
+                            q_count = prev_q_count
+                            total_question_count = prev_tqc
+                            break
+                        try:
+                            if mid_new_meta and isinstance(mid_new_meta, dict) and mid_new_meta.get("hearts") is not None:
+                                hearts = int(mid_new_meta.get("hearts"))
+                            elif hearts <= 0:
+                                hearts = 3
+                        except Exception:
+                            pass
+                        if hearts <= 0:
+                            hearts = 3
+                        try:
+                            if mid_new_meta and isinstance(mid_new_meta, dict):
+                                ad_every = mid_new_meta.get("adGateEvery", ad_every)
+                        except Exception:
+                            pass
+                        session_id = mid_new_sid
+                        question_obj = mid_new_q
+                        session_meta = mid_new_meta
+                        log(f"✅ Mid-ban restart OK → new sid active. Continue answering (prev totals preserved).")
+                        send_log_sync(f"✅ Mid-ban restart success at S{session_num} → continue answering after {q_count} questions already done.")
+                        last_diag = mid_diag_out if isinstance(mid_diag_out, dict) else None
+                        consec_ban_count = max(0, consec_ban_count)
+                        continue
+
+                    if hearts <= 0:
+                        log(f"💔 Hearts=0 after this answer → session end (coins so far: {session_coins})")
                         break
 
+                    next_info = result.get("next")
+                    result_next_q = None
+                    result_next_sid = None
                     if isinstance(next_info, dict):
-                        if "question" in next_info and isinstance(
-                            next_info.get("question"), dict
-                        ):
-                            question_obj = next_info["question"]
-                            session_id = result.get("sessionId") or session_id
-                            continue
-                        if "result" in next_info:
-                            break
-                        if next_info.get("questionId"):
-                            question_obj = next_info
-                            session_id = result.get("sessionId") or session_id
-                            continue
+                        if "question" in next_info and isinstance(next_info.get("question"), dict):
+                            result_next_q = next_info["question"]
+                            result_next_sid = result.get("sessionId") or next_info.get("sessionId")
+                        elif next_info.get("questionId"):
+                            result_next_q = next_info
+                            result_next_sid = result.get("sessionId") or next_info.get("sessionId")
+                        elif "result" in next_info:
+                            log(f"next.result present → session natural end.")
+                            next_info = "__END__"
+                    if not result_next_q and isinstance(result.get("question"), dict):
+                        result_next_q = result.get("question")
+                        result_next_sid = result.get("sessionId")
+                    if not result_next_q and isinstance(result.get("data"), dict):
+                        d = result["data"]
+                        if isinstance(d.get("question"), dict):
+                            result_next_q = d["question"]
+                            result_next_sid = d.get("sessionId") or result.get("sessionId")
+                        elif isinstance(d.get("next"), dict):
+                            n = d["next"]
+                            if isinstance(n.get("question"), dict):
+                                result_next_q = n["question"]
+                                result_next_sid = d.get("sessionId") or result.get("sessionId")
+                            elif n.get("questionId"):
+                                result_next_q = n
+                                result_next_sid = d.get("sessionId") or result.get("sessionId")
+                    if not result_next_q and isinstance(result.get("nextQuestion"), dict):
+                        result_next_q = result.get("nextQuestion")
+                        result_next_sid = result.get("sessionId")
+                    if not result_next_q and result.get("sessionId") and result.get("nextQuestionId"):
+                        pass
+
+                    if result_next_q and isinstance(result_next_q, dict):
+                        question_obj = result_next_q
+                        if result_next_sid:
+                            session_id = result_next_sid
+                        continue
+
+                    if next_info == "__END__":
+                        log(f"Session marked as ended (next.result) • {session_coins} coins")
+                        break
 
                     if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
-                        try:
-                            ad_hdrs = {
-                                "x-device-id": self.device_id,
-                                "x-device-info": self.device_info[:80],
-                                "accept": "application/json, text/plain, */*",
-                                "origin": "https://mixpix.app",
-                                "referer": "https://mixpix.app/",
-                            }
-                            nq = self.quiz_ad_ack(session_id, extra_headers=ad_hdrs)
-                        except Exception:
-                            try:
-                                nq = self.quiz_ad_ack(session_id)
-                            except Exception:
-                                nq = None
-                        if nq and isinstance(nq, dict):
-                            question_obj = nq
-                            continue
+                        ad_answer_ban = isinstance(result, dict) and result.get("enabled") is False
+                        if ad_answer_ban:
+                            log(f"🚨 ad_every block: answer has enabled=false (mid-ban) → skip all ad-gate probes.")
                         else:
+                            try:
+                                ad_hdrs = {
+                                    "x-device-id": self.device_id,
+                                }
+                                nq = self.quiz_ad_ack(session_id, extra_headers=ad_hdrs, pre_hint_ban=False)
+                            except Exception:
+                                try:
+                                    nq = self.quiz_ad_ack(session_id, pre_hint_ban=False)
+                                except Exception:
+                                    nq = None
+                            if nq and isinstance(nq, dict):
+                                question_obj = nq
+                                continue
+
+                    if hearts > 0:
+                        log(f"🔁 Answer submit returned no next question BUT hearts={hearts}>0 → trying ad-ack/lifeline fallback to keep session alive...")
+                        prefix = f"S{session_num}Q{q_idx+1}h{hearts}"
+                        send_log_sync(f"🔁 S{session_num} Q{q_idx+1}: success but next missing (correct={correct_flag}), hearts={hearts}>0 → FULL CONTINUATION PROBE. RAW:\n<pre>{json.dumps(result, ensure_ascii=False)[:800]}</pre>")
+                        fallback_found = False
+                        answer_enabled_false = isinstance(result, dict) and result.get("enabled") is False
+                        if answer_enabled_false:
+                            send_log_sync(
+                                f"🚨 S{session_num} Q{q_idx+1}: Answer result also has enabled=false (mid-session ban). "
+                                f"SKIP all ad-ack probes → end session, outer loop will handle temp-ban restart if possible."
+                            )
+                            log(f"🚨 Answer enabled=false detected in fallback section → end session cleanly (no pointless ad-ack probes)")
+                            try:
+                                if not last_diag or not isinstance(last_diag, dict):
+                                    last_diag = {}
+                                if not last_diag.get("disabled_flag"):
+                                    last_diag["disabled_flag"] = True
+                                last_diag["hard_ban"] = True
+                                try:
+                                    last_diag["source"] = "mid_session_answer_enabled_false"
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            ban_detected_any = True
+                            hard_ban_detected = True
                             break
-                    break
+                        for _t in range(1):
+                            try:
+                                nq_fb = self.quiz_ad_ack(session_id, raw_log_prefix=f"{prefix}#t{_t+1}", pre_hint_ban=answer_enabled_false)
+                            except Exception as e:
+                                log(f"   ad-ack try {_t+1} exception: {e}")
+                                nq_fb = None
+                            if nq_fb and isinstance(nq_fb, dict) and (
+                                nq_fb.get("questionId")
+                                or nq_fb.get("options")
+                                or nq_fb.get("questionHi")
+                                or nq_fb.get("questionEn")
+                            ):
+                                question_obj = nq_fb
+                                fallback_found = True
+                                log(f"   ad-ack attempt {_t+1} returned next question.")
+                                break
+                            medium_sleep(random.randint(300, 900))
+                        if fallback_found:
+                            continue
+                        log(f"⚠️ No next question found after all probes — session ends here (hearts={hearts} unused but API offers no next question).")
+                        break
+                    else:
+                        log(f"Session complete (no next + hearts=0) • {session_coins} coins")
+                        break
                 else:
+                    success_false_msg = ""
+                    if isinstance(result, dict):
+                        success_false_msg = result.get("message") or result.get("error") or ""
+                    send_log_sync(
+                        f"⚠️ S{session_num} Q{q_idx+1}: submit answer success=false RAW\n"
+                        f"<pre>{json.dumps(result, ensure_ascii=False)[:800] if isinstance(result,(dict,list)) else str(result)[:500]}</pre>"
+                    )
+                    ansfail_enabled_false = isinstance(result, dict) and result.get("enabled") is False
+                    if ansfail_enabled_false:
+                        send_log_sync(f"🚨 success=false AND enabled=false (mid-session ban) → end session cleanly.")
+                        try:
+                            if not last_diag or not isinstance(last_diag, dict):
+                                last_diag = {}
+                            last_diag["disabled_flag"] = True
+                            last_diag["hard_ban"] = True
+                        except Exception:
+                            pass
+                        ban_detected_any = True
+                        hard_ban_detected = True
+                        break
+                    if hearts > 0:
+                        log(f"⚠️ Answer submit success=false (msg={success_false_msg!r}) BUT hearts={hearts}>0 → ad-ack fallback...")
+                        fb_nq = None
+                        try:
+                            fb_nq = self.quiz_ad_ack(session_id, raw_log_prefix=f"S{session_num}Q{q_idx+1}FAIL", pre_hint_ban=ansfail_enabled_false)
+                        except Exception:
+                            fb_nq = None
+                        if fb_nq and isinstance(fb_nq, dict) and (
+                            fb_nq.get("questionId")
+                            or fb_nq.get("options")
+                            or fb_nq.get("questionHi")
+                            or fb_nq.get("questionEn")
+                        ):
+                            question_obj = fb_nq
+                            log("   ad-ack recovered next question after success=false.")
+                            continue
+                    log(f"❌ Answer submit success=false (msg={success_false_msg!r}) → break session.")
                     break
+
+            if isinstance(session_coins_max, int) and session_coins_max > session_coins:
+                session_coins = session_coins_max
 
             session_summary = (
                 f"🏁 Session {session_num} finished\n"
@@ -3418,49 +4069,145 @@ class MiniPixV2:
             log(session_summary)
             send_log_sync(f"<b>{session_summary}</b>")
 
-            try:
-                self._refresh_auth_state(full=ban_detected_any, with_quiz_status=False)
-            except Exception:
-                try:
-                    self.get_user()
-                except Exception:
-                    pass
-
             sessions_done += 1
             if session_num < max_sessions:
-                next_sleep_s = random.uniform(4.0, 17.0)
-                if ban_detected_any:
-                    next_sleep_s += random.uniform(8.0, 22.0)
-                if random.random() < 0.22:
-                    next_sleep_s += random.uniform(6.0, 18.0)
+                relogin_ok = False
+                cur_token = None
+                cur_label = None
                 try:
-                    post_full = (sessions_done % 2 == 0) or ban_detected_any
-                    self._refresh_auth_state(full=post_full, with_quiz_status=True)
-                    label = "FULL" if post_full else "light"
-                    send_log_sync(f"♻️ Post-session {session_num}: {label} auth-state refresh before next session." + (" (BAN cool-off)" if ban_detected_any else ""))
+                    cur_token = self.access_token
+                    cur_label = self.current_account_label or self.phone or (f"acc_{str(self.user_id)[-6:]}" if self.user_id else None)
                 except Exception:
+                    cur_token = None
+                log(f"🔁 Auto re-login after session {session_num} (device bound to JWT nonce + full server reset)...")
+                send_log_sync(f"🔁 POST-SESSION {session_num}: AUTO RE-LOGIN (device_id bound to JWT nonce) before next session. hard_ban={hard_ban_detected} ban={ban_detected_any}")
+                try:
+                    if cur_token:
+                        jwt = self._decode_jwt_payload(cur_token)
+                        if isinstance(jwt, dict) and jwt.get("nonce"):
+                            self.device_id = str(jwt["nonce"])
+                        self._rotate_headers(full=False)
+                        try:
+                            self.session.headers["x-device-id"] = self.device_id
+                        except Exception:
+                            pass
+                        self.session.headers["authorization"] = f"Bearer {cur_token}"
+                        self.access_token = cur_token
+                        self._device_frozen = True
+                        medium_sleep(random.randint(200, 700))
+                        ok_me = False
+                        try:
+                            sc1, raw1 = self._req("GET", "/users/me", timeout=12)
+                            if sc1 == 200 and isinstance(raw1, dict):
+                                uid = raw1.get("_id") or raw1.get("id") or raw1.get("userId")
+                                if uid:
+                                    self.user_id = uid
+                                pid = raw1.get("master_profile") or raw1.get("masterProfile")
+                                if pid:
+                                    self.profile_id = pid
+                                ph = raw1.get("mobile") or raw1.get("phone")
+                                if ph:
+                                    self.phone = ph
+                                ok_me = True
+                        except Exception:
+                            pass
+                        ok_user = False
+                        if self.user_id:
+                            try:
+                                sc2, raw2 = self._req("GET", f"/users/{self.user_id}", timeout=12)
+                                if sc2 == 200 and isinstance(raw2, dict):
+                                    self.profile_id = raw2.get("master_profile", self.profile_id)
+                                    ph2 = raw2.get("mobile")
+                                    if ph2 and not self.phone:
+                                        self.phone = ph2
+                                    ok_user = True
+                            except Exception:
+                                pass
+                        try:
+                            self.open_app()
+                        except Exception:
+                            pass
+                        try:
+                            self.integrity_attest()
+                        except Exception:
+                            pass
+                        try:
+                            self.get_quiz_status()
+                        except Exception:
+                            pass
+                        if ok_me or ok_user:
+                            try:
+                                if cur_label:
+                                    self._store_current_account(label=cur_label)
+                            except Exception:
+                                pass
+                            relogin_ok = True
+                            send_log_sync(
+                                f"✅ AUTO RE-LOGIN OK | device_id(nonce)={str(self.device_id)[-8:]}... | "
+                                f"/users/me={ok_me} /users/id={ok_user}"
+                            )
+                except Exception as re:
+                    send_log_sync(f"⚠️ Auto re-login exception: {re}")
+                    relogin_ok = False
+
+                if not relogin_ok:
                     try:
-                        post_fb = (sessions_done % 2 == 0) or ban_detected_any
-                        self.refresh_session_fingerprint(full=post_fb)
-                        send_log_sync(f"♻️ Post-session {session_num}: refresh fallback done.")
+                        self._refresh_auth_state(full=False, with_quiz_status=True)
+                        send_log_sync(f"♻️ Fallback: light auth-state refresh (relogin did not complete).")
                     except Exception:
-                        pass
-                log(f"⏱️ Next quiz session in ~{next_sleep_s:.1f}s...")
+                        try:
+                            self.refresh_session_fingerprint(full=False)
+                        except Exception:
+                            pass
+
+                next_sleep_s = random.uniform(60.0, 120.0)
+                if hard_ban_detected:
+                    next_sleep_s += random.uniform(30.0, 60.0)
+                elif ban_detected_any:
+                    next_sleep_s += random.uniform(15.0, 30.0)
+                tags = []
+                if relogin_ok:
+                    tags.append("AUTO RE-LOGIN DONE")
+                if hard_ban_detected:
+                    tags.append("+ HARD BAN extra")
+                elif ban_detected_any:
+                    tags.append("+ BAN extra")
+                log_msg = f"⏱️ Next quiz session in ~{next_sleep_s:.1f}s (" + ", ".join(tags) + ")..."
+                send_log_sync(
+                    f"⏳ INTER-SESSION delay after session {session_num}: {next_sleep_s:.1f}s. "
+                    + " | ".join(tags)
+                )
+                log(log_msg)
                 time.sleep(next_sleep_s)
 
+        self._session_active = False
+        final_balance_val = self.get_balance_robust(retries=3)
+        try:
+            fb_vi = int(final_balance_val)
+        except Exception:
+            fb_vi = None
+        if not isinstance(fb_vi, int) or fb_vi <= 0:
+            try:
+                cached_bal = getattr(self, "_cached_balance", None)
+                if isinstance(cached_bal, int) and cached_bal > 0:
+                    final_balance_val = cached_bal
+                elif total_coins and isinstance(total_coins, int) and total_coins > 0:
+                    final_balance_val = f"≥{total_coins} (balance API returned 0)"
+            except Exception:
+                pass
         final = (
             f"<b>🏁 QUIZ FINISHED</b>\n"
             f"User: <code>{telegram_user_id}</code>\n"
             f"Sessions: {sessions_done}\n"
             f"Total coins earned: ~{total_coins}\n"
-            f"Balance now: {self.get_balance()}"
+            f"Balance now: {final_balance_val}"
         )
         send_log_sync(final)
 
         return {
             "sessions": sessions_done,
             "total_coins": total_coins,
-            "balance": self.get_balance(),
+            "balance": final_balance_val if isinstance(final_balance_val, int) else total_coins,
         }
 
 
@@ -3472,23 +4219,27 @@ _user_bots_lock = threading.Lock()
 def get_bot(user_id: int) -> MiniPixV2:
     with _user_bots_lock:
         if user_id not in user_bots:
-            user_bots[user_id] = MiniPixV2()
+            bot = MiniPixV2()
+            bot.telegram_owner_id = int(user_id)
+            bot.accounts = bot._load_accounts()
+            user_bots[user_id] = bot
+        else:
+            existing = user_bots[user_id]
+            if existing.telegram_owner_id is None:
+                existing.telegram_owner_id = int(user_id)
         return user_bots[user_id]
 
 
 def main_menu_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("💰 Balance"), KeyboardButton("📊 Campaign")],
+            [KeyboardButton("💰 Balance")],
             [KeyboardButton("👥 Accounts"), KeyboardButton("➕ Login")],
-            [
-                KeyboardButton("🎬 Browse Series"),
-                KeyboardButton("🎬 Watch All (Fast)"),
-            ],
             [
                 KeyboardButton("🧠 Quiz Status"),
                 KeyboardButton("🤖 Run Quiz"),
             ],
+            [KeyboardButton("🔄 Multi-Account Quiz")],
             [KeyboardButton("🔑 Set Groq Key"), KeyboardButton("🔑 Token Login")],
             [KeyboardButton("ℹ️ Help")],
         ],
@@ -3530,7 +4281,7 @@ def build_episode_keyboard(series_id, ep_status, series_title=None):
     kb.append(
         [
             InlineKeyboardButton(
-                f"🔥 Watch ALL (Fast) This Series",
+                f"🔥 Watch All Episodes This Series",
                 callback_data=f"sr_all4x:{series_id}",
             )
         ]
@@ -3573,14 +4324,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(user.id)
     text = (
         f"👋 Hi {user.first_name}!\n\n"
-        "MiniPix Unified Bot ready.\n\n"
+        "MiniPix Unified Bot ready — *Quiz-Only Mode*\n\n"
         "🔐 *Login*\n"
         "• /login – OTP (Phone) login\n"
         "• /tokenlogin `<token>` – direct Bearer token login\n\n"
-        "🎬 *Watch*\n"
-        "• /series – browse series (button me `[series_id]` dikhta hai)\n"
-        "• /watch – Smart 8x Watch *ALL* series (Option 11)\n"
-        "• /watch `<SERIES_ID>` – uss SERIES ke saare eps 8x watch\n\n"
+        "👥 *Accounts*\n"
+        "• /accounts – saved accounts list / switch\n"
+        "• /importaccounts – JSON text se accounts import\n"
+        "• *MiniPix accounts JSON* → chat me upload as document → auto-import Mongo + local JSON dono me.\n\n"
         "🧠 *Quiz*\n"
         "• /setgroq `gsk_xxx` – apna Groq key set karo\n"
         "• /addkey `gsk_xxx` – aur ek key add karo (max 5)\n"
@@ -3588,34 +4339,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /removekey `1` – index se key hatao\n"
         "• /setkeys `k1 k2 k3` – sab keys replace karo\n"
         "• /mygroq – apne keys check karo\n"
-        "• /quizrun – Auto Quiz solve (Groq AI)\n"
+        "• /quizrun – Auto Quiz solve (1 session per click — **EXACTLY 1 SESSION** per Run)\n"
         "• /quiz – quiz status\n"
     )
     if bot.access_token:
         text += f"\n✅ Logged in: {bot.current_account_label or bot.phone}"
     else:
         text += "\n⚠️ Not logged in → /login"
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    await update.message.reply_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "📖 *Commands*\n\n"
+        "📖 *Commands (Quiz-Only Mode)*\n\n"
 
         "➡️ *Login & Accounts*\n"
         "/login – OTP (Phone) ya Bearer Token login\n"
         "/tokenlogin `JWT_TOKEN` – direct token login (2 tarike)\n"
         "/accounts – saved accounts list / switch\n"
+        "/useaccount `<label>` – specific account switch karo\n"
+        "/reloadaccounts – saved accounts fir se load karo (file + Mongo)\n"
+        "/importaccounts `{JSON}` – inline JSON text se accounts import\n"
+        "*JSON Upload* – `minipix_accounts.json` file chat me **document** ke roop me upload karo → auto import Mongo + local JSON dono me\n"
         "/logout – logout\n\n"
-
-        "➡️ *Series / Watch*\n"
-        "/series `[page]` – list all series (with ID)\n"
-        "/watch – Option 11: *ALL* series 8x smart watch\n"
-        "/watch `SERIES_ID` – *specific* series ke saare episodes 8x watch\n\n"
 
         "➡️ *Quiz*\n"
         "/quiz – quiz status (hearts, daily cap)\n"
-        "/quizrun – Groq AI auto quiz solve\n\n"
+        "/quizrun – Groq AI auto quiz solve — **EXACTLY 1 SESSION per click**. Next session ke liye fir se `/quizrun` ya `🤖 Run Quiz` button dabao (saves daily 5 login limit)\n\n"
 
         "➡️ *Groq API Key Management (Multi-Key Speed)*\n"
         "/setgroq `gsk_xxx` – apna Groq API key set (1 ya multiple)\n"
@@ -3629,8 +4379,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         "➡️ *Misc*\n"
         "/start – main menu\n"
-        "/balance – coin balance\n"
-        "/campaign – campaign + daily cap\n\n"
+        "/balance – coin balance\n\n"
 
         "---\n\n"
 
@@ -3651,6 +4400,20 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Token starts with: `eyJ` (always)\n"
         "Token length: 200+ chars\n"
         "⚠️ Token 30 din baad expire hota hai → tab naya lagana padega.\n\n"
+
+        "*Accounts JSON File Format (upload as document):*\n"
+        "```\n"
+        "{\n"
+        '  "accounts": {\n'
+        '    "Account1 Label": {\n'
+        '      "access_token": "eyJ....",\n'
+        '      "user_id": "...",\n'
+        '      "phone": "+91...",\n'
+        '      "profile_id": "..."\n'
+        "    }\n"
+        "  }\n"
+        "}\n"
+        "```\n\n"
 
         "Free Groq key: https://console.groq.com/keys"
     )
@@ -4004,12 +4767,11 @@ async def series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📚 *Series List* — Page {cur_page}/{total_pages}  ({total} total)",
         "",
         "Button mein `[series_id]` dikh raha hai. Use karo:",
-        "`/watch <series_id>` → us series ke SARE episodes 8x watch",
+        "`/watch <series_id>` → us series ke SARE episodes 1x watch",
         "",
         "Icons:",
         "`▶` Not watched",
-        "`1/8–7/8` Watched N times",
-        "`✔` 8x complete (max reward)",
+        "`✔` 1x complete (max reward)",
         "",
         "Ya kisi series par tap karo → episode menu dikhega.",
     ]
@@ -4087,9 +4849,9 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎞️ *{title}*\n"
             f"Total episodes: {total_eps}\n"
             f"Progress: {done}/{total_eps} started | "
-            f"{maxed}/{total_eps} 8x-complete\n\n"
+            f"{maxed}/{total_eps} 1x-complete\n\n"
             "• Tap `E1`, `E2`... → 1 episode watch\n"
-            "• Tap *🔥 Watch ALL (8x) This Series* → full series smart-repeat"
+            "• Tap *🔥 Watch All Episodes This Series* → full series 1x watch"
         )
         await query.edit_message_text(
             text, parse_mode="Markdown", reply_markup=kb
@@ -4141,14 +4903,13 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 ok = result.get("ok") if isinstance(result, dict) else False
                 status = result.get("status") if isinstance(result, dict) else "?"
-                nth = result.get("nth_watch") if isinstance(result, dict) else "?"
                 reward = result.get("reward_expected") if isinstance(result, dict) else "?"
                 delta = result.get("delta") if isinstance(result, dict) else None
                 bal_after = result.get("balance_after") if isinstance(result, dict) else None
                 t = (
                     f"🏁 Episode done: S{sid} E{ep_no}\n"
                     f"Result: {'✅' if ok else '❌'} status={status}\n"
-                    f"Watch #{nth} (expected +{reward})\n"
+                    f"Watch 1x (expected +{reward})\n"
                 )
                 if delta is not None:
                     t += f"💰 Delta: {delta:+d}  |  Balance now: {bal_after}"
@@ -4173,7 +4934,7 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Not logged in.")
                 return
             msg = await query.message.reply_text(
-                f"🔥 Starting SMART 8x repeat for series {sid}..."
+                f"🔥 Starting 1x Watch All for series {sid}..."
             )
             loop = asyncio.get_running_loop()
 
@@ -4182,7 +4943,7 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     loop.call_soon_threadsafe(
                         lambda: asyncio.create_task(
                             msg.edit_text(
-                                f"🔥 Series 8x Watch S{sid}…\n\n{str(text)[-1400:]}"
+                                f"🔥 Series Watch S{sid}…\n\n{str(text)[-1400:]}"
                             )
                         )
                     )
@@ -4205,7 +4966,7 @@ async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             skip = result.get("skipped", 0) if isinstance(result, dict) else 0
             fail = result.get("failed", 0) if isinstance(result, dict) else 0
             t = (
-                f"🏁 Series 8x done: {result.get('series_title', sid)}\n\n"
+                f"🏁 Series done: {result.get('series_title', sid)}\n\n"
                 f"Watched: {watched}\nSkip: {skip}\nFail: {fail}\n"
             )
             if isinstance(result, dict) and result.get("delta") is not None:
@@ -4289,6 +5050,19 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ok:
         bot.open_app()
         bal = bot.get_balance()
+        try:
+            bot._store_current_account()
+        except Exception:
+            pass
+        send_log_sync(
+            f"✅ OTP LOGIN SUCCESS\n"
+            f"User ID: {bot.user_id}\n"
+            f"Phone: {bot.phone or '-'}\n"
+            f"referralCode: {getattr(bot, 'referral_code', None) or '-'}\n"
+            f"referredBy: {getattr(bot, 'referred_by', None) or '-'}\n"
+            f"source: {getattr(bot, 'login_source', None) or '-'}\n"
+            f"Balance: {bal}"
+        )
         await update.message.reply_text(
             f"✅ Login success!\n💰 Balance: {bal}",
             reply_markup=main_menu_keyboard(),
@@ -4318,6 +5092,19 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ok:
         bot.open_app()
         bal = bot.get_balance()
+        try:
+            bot._store_current_account()
+        except Exception:
+            pass
+        send_log_sync(
+            f"✅ TOKEN LOGIN (interactive) SUCCESS\n"
+            f"User ID: {bot.user_id}\n"
+            f"Phone: {bot.phone or '-'}\n"
+            f"referralCode: {getattr(bot, 'referral_code', None) or '-'}\n"
+            f"referredBy: {getattr(bot, 'referred_by', None) or '-'}\n"
+            f"source: {getattr(bot, 'login_source', None) or '-'}\n"
+            f"Balance: {bal}"
+        )
         await update.message.reply_text(
             f"✅ Token Login Success!\n💰 Balance: {bal}",
             reply_markup=main_menu_keyboard(),
@@ -4376,11 +5163,66 @@ async def tokenlogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot = get_bot(update.effective_user.id)
     ok = bot.login_with_token(token)
     if ok:
-        bot.open_app()
-        bal = bot.get_balance()
+        try:
+            bot.open_app()
+        except Exception:
+            pass
+        try:
+            me_ok, me_raw = bot._req("GET", "/users/me")
+            if me_ok == 200 and isinstance(me_raw, dict):
+                try:
+                    fresh_uid = me_raw.get("_id") or me_raw.get("id") or me_raw.get("userId")
+                    if fresh_uid:
+                        bot.user_id = fresh_uid
+                except Exception:
+                    pass
+                try:
+                    fresh_prof = me_raw.get("master_profile") or me_raw.get("masterProfile") or me_raw.get("pid")
+                    if fresh_prof:
+                        bot.profile_id = fresh_prof
+                except Exception:
+                    pass
+                try:
+                    fresh_phone = me_raw.get("mobile") or me_raw.get("phone")
+                    if fresh_phone:
+                        bot.phone = fresh_phone
+                except Exception:
+                    pass
+                try:
+                    ref = me_raw.get("referralCode") or me_raw.get("referral_code")
+                    if ref:
+                        bot.referral_code = ref
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        bal = None
+        try:
+            bal = bot.get_balance()
+        except Exception:
+            bal = "?"
+        try:
+            bot._cached_balance = bal
+            lbl = bot.phone or bot.current_account_label or f"acc_{str(bot.user_id)[-6:]}"
+            bot.current_account_label = lbl
+            bot._store_current_account(label=lbl)
+        except Exception:
+            pass
+        send_log_sync(
+            f"✅ TOKEN LOGIN SUCCESS (Fresh profile fetched & saved)\n"
+            f"User ID: {bot.user_id}\n"
+            f"Phone: {bot.phone or '-'}\n"
+            f"referralCode: {getattr(bot, 'referral_code', None) or '-'}\n"
+            f"referredBy: {getattr(bot, 'referred_by', None) or '-'}\n"
+            f"source: {getattr(bot, 'login_source', None) or '-'}\n"
+            f"Balance: {bal}"
+        )
         await update.message.reply_text(
-            f"✅ Token Login Success!\n💰 Balance: {bal}",
+            f"✅ Token Login Success!\n"
+            f"Account: `{bot.phone or '-'}`\n"
+            f"💰 Balance: {bal}",
             reply_markup=main_menu_keyboard(),
+            parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
@@ -4390,6 +5232,137 @@ async def tokenlogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "2. Token complete paste kiya? (copy karte waqt last/start ka hissa na chop ho)\n"
             "3. Token expire to nahi ho gaya? (dobara HTTP Toolkit se capture karo)\n"
         )
+
+
+async def importaccounts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_txt = (
+        "*Accounts JSON Import (2 Methods)*\n\n"
+        "Method 1: /importaccounts command ke saath JSON text bhejo.\n"
+        "Method 2 (RECOMMENDED): Bas `minipix_accounts.json` file ko chat me upload karo as document —\n"
+        "         bot auto-import kar lega Mongo + local JSON dono me.\n\n"
+        "*JSON Format:*\n"
+        "```\n"
+        "{\n"
+        '  "accounts": {\n'
+        '    "Account1 Label": {\n'
+        '      "access_token": "eyJ....",\n'
+        '      "user_id": "...",\n'
+        '      "phone": "+91...",\n'
+        '      "profile_id": "..."\n'
+        "    }\n"
+        "  }\n"
+        "}\n"
+        "```\n"
+    )
+    if not context.args:
+        await update.message.reply_text(help_txt, parse_mode="Markdown")
+        return
+    raw = None
+    try:
+        raw = " ".join(context.args).strip()
+        data = json.loads(raw)
+    except Exception as e:
+        await update.message.reply_text(f"❌ JSON parse failed: {e}\n\n{help_txt}", parse_mode="Markdown")
+        return
+    bot = get_bot(update.effective_user.id)
+    added, skipped = _import_accounts_data(bot, data)
+    await update.message.reply_text(
+        f"✅ Import done\nAdded/Updated: {added}\nSkipped (no token): {skipped}\nTotal accounts now: {len(bot.accounts or {})}"
+    )
+
+
+def _import_accounts_data(bot, data):
+    loaded = None
+    if isinstance(data, dict):
+        if isinstance(data.get("accounts"), dict):
+            loaded = data.get("accounts")
+        else:
+            loaded = data
+    elif isinstance(data, list):
+        loaded = {}
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                continue
+            token = item.get("access_token") or item.get("token") or ""
+            if not token:
+                continue
+            label = item.get("label") or item.get("phone") or item.get("name") or f"acc_{i+1}"
+            loaded[label] = item
+    if not isinstance(loaded, dict):
+        return 0, 0
+    added = 0
+    skipped = 0
+    for label, v in loaded.items():
+        if not isinstance(v, dict):
+            skipped += 1
+            continue
+        token = v.get("access_token") or v.get("token") or ""
+        if not token:
+            skipped += 1
+            continue
+        bot.accounts[label] = {
+            "access_token": token,
+            "user_id": v.get("user_id") or v.get("uid") or v.get("_id"),
+            "profile_id": v.get("profile_id") or v.get("master_profile") or v.get("pid"),
+            "phone": v.get("phone") or v.get("mobile"),
+            "added_on": v.get("added_on") or date.today().isoformat(),
+        }
+        added += 1
+    try:
+        bot._save_accounts()
+    except Exception:
+        pass
+    return added, skipped
+
+
+async def json_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = getattr(update.message, "document", None) or getattr(update.effective_message, "document", None)
+    if not doc:
+        return
+    fn = (getattr(doc, "file_name", "") or "").lower()
+    if not (fn.endswith(".json") or "account" in fn or "minipix" in fn):
+        return
+    uid = update.effective_user.id if getattr(update, "effective_user", None) else None
+    try:
+        await update.message.reply_text("📥 JSON file received, downloading & importing accounts...")
+    except Exception:
+        pass
+    try:
+        f = await context.bot.get_file(doc.file_id)
+        if not f:
+            await update.message.reply_text("❌ File download failed.")
+            return
+        import io
+        content_bytes = await f.download_as_bytearray()
+        if isinstance(content_bytes, bytearray):
+            raw_text = content_bytes.decode("utf-8", errors="ignore")
+        else:
+            raw_text = str(content_bytes)
+        data = json.loads(raw_text)
+    except Exception as e:
+        try:
+            await update.message.reply_text(f"❌ Failed: {e}")
+        except Exception:
+            pass
+        return
+    bot = get_bot(uid)
+    added, skipped = _import_accounts_data(bot, data)
+    try:
+        if uid:
+            bot2 = get_bot(uid)
+            bot2.accounts = bot2._load_accounts()
+    except Exception:
+        pass
+    try:
+        await update.message.reply_text(
+            f"✅ File '{fn or 'document.json'}' imported OK\n"
+            f"Added/Updated: {added}\n"
+            f"Skipped (no token): {skipped}\n"
+            f"Total accounts now: {len(bot.accounts or {})}\n"
+            f"Type /accounts to see list, or /useaccount <label> to switch."
+        )
+    except Exception:
+        pass
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4419,14 +5392,14 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if series_id_arg:
             msg = await update.message.reply_text(
-                f"🔥 Starting SMART 8x repeat for Series `{series_id_arg}`...\n"
+                f"🔥 Starting 1x Watch All for Series `{series_id_arg}`...\n"
                 "(series detail + episodes load ho rahe hain)",
                 parse_mode="Markdown",
             )
             mode_label = f"Series {series_id_arg}"
         else:
             msg = await update.message.reply_text(
-                "🚀 Starting Smart 8x Watch (Option 11 mode)...\nThoda time lagega."
+                "🚀 Starting Watch ALL (Option 11 mode, 1x each ep)...\nThoda time lagega."
             )
             mode_label = "Opt11 ALL"
 
@@ -4526,32 +5499,45 @@ async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    await update.message.reply_text("Kitne quiz sessions? (1-20, default 15):")
-    return WAIT_QUIZ_SESSIONS
+    lines = [
+        "🤖 **Run Quiz Setup**\n",
+        "🎯 **Level (Sessions)** kitne chalaane hain?\n",
+        "  (1 Level = 1 FULL session = hearts=0 / daily end tak)\n",
+        "Examples:",
+        "  • `1` = 1 level/session (default — jaise pehle hota tha)",
+        "  • `3` = 3 level/sessions is account par continuous",
+        "  • `10` = 10 level/sessions",
+        "",
+        "Sirf ek number bhejo (1-20):",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return WAIT_RUNQUIZ_SESSIONS
 
 
-async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def quiz_sessions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = get_bot(update.effective_user.id)
+    text = (update.message.text or "").strip()
     try:
-        n = int(update.message.text.strip() or "15")
-        n = max(1, min(20, n))
+        sessions = int(text)
+        if sessions < 1:
+            sessions = 1
+        if sessions > 20:
+            sessions = 20
     except Exception:
-        n = 15
-    context.user_data["quiz_sessions"] = n
+        await update.message.reply_text("❌ Sirf valid number bhejo (1-20). Example: `1` ya `3`", parse_mode="Markdown")
+        return WAIT_RUNQUIZ_SESSIONS
 
     uid = update.effective_user.id
     busy_lock = get_user_busy_lock(uid)
     if not busy_lock.acquire(blocking=False):
-        await update.message.reply_text(
-            "⏳ Pehle se ek task chal raha hai. Wait karo."
-        )
+        await update.message.reply_text("⏳ Pehle se ek task chal raha hai. Wait karo.")
         return ConversationHandler.END
 
     try:
-        bot = get_bot(uid)
-        sessions = context.user_data.get("quiz_sessions", 15)
-
         msg = await update.message.reply_text(
-            f"🤖 Running {sessions} sessions (delay 10s)..."
+            f"🤖 Quiz Starting...\n"
+            f"Sessions planned: {sessions}\n"
+            f"Starting in 10s..."
         )
 
         loop = asyncio.get_running_loop()
@@ -4561,7 +5547,7 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 loop.call_soon_threadsafe(
                     lambda: asyncio.create_task(
                         msg.edit_text(
-                            f"🤖 Quiz running…\n\n{str(text)[-1400:]}"
+                            f"🤖 Quiz running ({sessions} sessions max)…\n\n{str(text)[-1400:]}"
                         )
                     )
                 )
@@ -4588,9 +5574,10 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             balance = result.get("balance") if isinstance(result, dict) else "?"
             await msg.edit_text(
                 f"🏁 Quiz done\n"
-                f"Sessions: {sessions_done}\n"
+                f"Sessions: {sessions_done} / planned {sessions}\n"
                 f"Coins this run: ~{total_coins}\n"
-                f"Current balance: {balance}"
+                f"Current balance: {balance}\n\n"
+                f"Agar aur chahiye → '🤖 Run Quiz' fir se dabao."
             )
     finally:
         try:
@@ -4598,6 +5585,567 @@ async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     return ConversationHandler.END
+
+
+async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Quiz sessions prompt now moved to Run Quiz flow.")
+    return ConversationHandler.END
+
+
+async def multi_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = get_bot(update.effective_user.id)
+    if not get_user_groq_key(update.effective_user.id):
+        await update.message.reply_text(
+            "❌ Pehle apna Groq API key set karo:\n\n"
+            "`/setgroq gsk_xxxxxxxx`\n\n"
+            "Free key: https://console.groq.com/keys",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    accs = bot.list_accounts()
+    if not accs:
+        await update.message.reply_text(
+            "❌ Koi saved accounts nahi hai.\n"
+            "Pehle /login ya /tokenlogin se accounts add karo."
+        )
+        return ConversationHandler.END
+
+    context.user_data["selected_accounts"] = set()
+    context.user_data["all_accounts"] = accs
+
+    lines = [
+        "🔄 **Multi-Account Quiz Setup**\n",
+        "Step 1/3: Select accounts for quiz rotation.\n",
+        "Select karne ke liye account ke button pe tap karo (toggle).\n",
+        "Selected = ✅ | Not selected = ⬜\n",
+        f"\nTotal saved accounts: {len(accs)}\n",
+    ]
+
+    kb = []
+    selected = context.user_data["selected_accounts"]
+    for lbl in accs:
+        acc = bot.accounts[lbl]
+        ph = acc.get("phone") or "?"
+        icon = "✅" if lbl in selected else "⬜"
+        kb.append([
+            InlineKeyboardButton(f"{icon} {lbl} | {ph}", callback_data=f"mq_tgl:{lbl}")
+        ])
+    
+    kb.append([
+        InlineKeyboardButton("✅ Select All", callback_data="mq_all"),
+        InlineKeyboardButton("❌ Clear All", callback_data="mq_none"),
+    ])
+    kb.append([
+        InlineKeyboardButton("➡️ Next (Set Sessions per Account)", callback_data="mq_next1"),
+    ])
+
+    reply_markup = InlineKeyboardMarkup(kb)
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
+    return WAIT_MULTI_QUIZ_ACCOUNTS
+
+
+async def multi_quiz_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    bot = get_bot(query.from_user.id)
+
+    if "selected_accounts" not in context.user_data:
+        context.user_data["selected_accounts"] = set()
+    selected = context.user_data["selected_accounts"]
+    all_accs = context.user_data.get("all_accounts", bot.list_accounts())
+
+    if data.startswith("mq_tgl:"):
+        lbl = data[7:]
+        if lbl in selected:
+            selected.discard(lbl)
+        else:
+            selected.add(lbl)
+    elif data == "mq_all":
+        selected = set(all_accs)
+        context.user_data["selected_accounts"] = selected
+    elif data == "mq_none":
+        selected = set()
+        context.user_data["selected_accounts"] = selected
+    elif data == "mq_next1":
+        if len(selected) == 0:
+            await query.answer("Pehle kam se kam 1 account select karo!", show_alert=True)
+            return WAIT_MULTI_QUIZ_ACCOUNTS
+        context.user_data["selected_accounts"] = list(selected)
+        
+        lines = [
+            "🔄 **Multi-Account Quiz Setup**\n",
+            f"Step 2/3: Accounts selected: {len(selected)}\n",
+        ]
+        for i, lbl in enumerate(list(selected)[:15], 1):
+            acc = bot.accounts.get(lbl, {})
+            ph = acc.get("phone") or "?"
+            lines.append(f"  {i}. {lbl} | {ph}")
+        if len(selected) > 15:
+            lines.append(f"  ... +{len(selected)-15} more")
+        
+        lines.append("\nAb **Sessions per account** set karo (kitne poore sessions ek account par chalaane hain phir next account pe jump):\n")
+        lines.append("Examples:")
+        lines.append("  • `1` = 1 poora session (hearts khatam / session end) → phir next account")
+        lines.append("  • `2` = 2 sessions on Acc1 → 2 sessions on Acc2 → ...")
+        lines.append("  • `3` = 3 sessions per account phir rotate")
+        lines.append("\nSirf ek number bhejo (1-10):")
+        
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+        return WAIT_MULTI_QUIZ_LEVEL
+
+    kb = []
+    for lbl in all_accs:
+        acc = bot.accounts[lbl]
+        ph = acc.get("phone") or "?"
+        icon = "✅" if lbl in selected else "⬜"
+        kb.append([
+            InlineKeyboardButton(f"{icon} {lbl} | {ph}", callback_data=f"mq_tgl:{lbl}")
+        ])
+    
+    kb.append([
+        InlineKeyboardButton("✅ Select All", callback_data="mq_all"),
+        InlineKeyboardButton("❌ Clear All", callback_data="mq_none"),
+    ])
+    kb.append([
+        InlineKeyboardButton("➡️ Next (Set Sessions Count)", callback_data="mq_next1"),
+    ])
+
+    lines = [
+        "🔄 **Multi-Account Quiz Setup**\n",
+        "Step 1/3: Select accounts for quiz rotation.\n",
+        "Select karne ke liye account ke button pe tap karo (toggle).\n",
+        f"Selected: {len(selected)} / {len(all_accs)}\n",
+    ]
+
+    reply_markup = InlineKeyboardMarkup(kb)
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
+    return WAIT_MULTI_QUIZ_ACCOUNTS
+
+
+async def multi_quiz_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    try:
+        level = int(text)
+        if level < 1:
+            level = 1
+        if level > 10:
+            level = 10
+    except Exception:
+        await update.message.reply_text("❌ Sirf ek valid number bhejo (1-10). Example: `1` = 1 session per account", parse_mode="Markdown")
+        return WAIT_MULTI_QUIZ_LEVEL
+
+    context.user_data["quiz_level"] = level
+
+    lines = [
+        "🔄 **Multi-Account Quiz Setup - Step 3/4**\n",
+        f"✅ Step 1: {len(context.user_data.get('selected_accounts', []))} accounts selected",
+        f"✅ Step 2: Level/Sessions per account = {level}\n",
+        "🔄 **Kitne TOTAL rotation cycles** chalaane hain?\n",
+        "  (Har 1 Cycle = sab selected accounts ko 1 baar level=N sessions complete karvana)\n",
+        "Examples:",
+        "  • `0` ya blank = Auto-calculate (recommended — based on accounts * level)",
+        "  • `2` = 2 full cycles",
+        "  • `5` = 5 full cycles",
+        "  • `20` = 20 full cycles (max 50)",
+        "",
+        "Sirf ek number bhejo (0-50):",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
+
+
+async def multi_quiz_total_rotations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    max_rot = None
+    try:
+        if text and text.lower() != "auto":
+            v = int(text)
+            if v < 0:
+                v = 0
+            if v > 50:
+                v = 50
+            if v > 0:
+                max_rot = v
+    except Exception:
+        await update.message.reply_text("❌ Sirf valid number bhejo (0-50). Auto ke liye 0 ya blank bhejo.", parse_mode="Markdown")
+        return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
+
+    context.user_data["max_rotations"] = max_rot
+
+    selected = context.user_data.get("selected_accounts", [])
+    level = context.user_data.get("quiz_level", 1)
+    bot = get_bot(update.effective_user.id)
+
+    lines = [
+        "🔄 **Multi-Account Quiz Setup - Final Confirmation (Step 4/4)**\n",
+        f"Selected Accounts ({len(selected)}):",
+    ]
+    for i, lbl in enumerate(selected, 1):
+        acc = bot.accounts.get(lbl, {})
+        ph = acc.get("phone") or "?"
+        try:
+            bal = bot.accounts[lbl].get("_cached_balance", "?")
+        except Exception:
+            bal = "?"
+        lines.append(f"  {i}. {lbl} | {ph} | Bal: {bal}")
+    
+    lines.append(f"\n🎯 Level (Sessions per account): {level}")
+    if max_rot is None:
+        lines.append(f"🔄 Total Rotation cycles: Auto (bot decide karega based on load)")
+    else:
+        lines.append(f"🔄 Total Rotation cycles: {max_rot}")
+    lines.append(f"🔄 Flow:")
+    lines.append(f"   Cycle 1: Acc1 → {level} session(s) → Acc2 → ...")
+    lines.append(f"   Cycle 2: Acc1 → {level} session(s) → Acc2 → ...")
+    lines.append(f"   ... until total cycles = {max_rot if max_rot else 'Auto'}")
+    lines.append(f"💾 Questions + server correctIndex saved to MongoDB cache → AI usage kam hoga")
+    lines.append("\nConfirm? Tap button below ya 'cancel' likho:")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 START Multi-Account Quiz", callback_data="mq_start")],
+        [InlineKeyboardButton("⬅️ Back to Account Select", callback_data="mq_back")],
+    ])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=kb,
+        parse_mode="Markdown",
+    )
+    return WAIT_MULTI_QUIZ_CONFIRM
+
+
+async def multi_quiz_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    bot = get_bot(query.from_user.id)
+
+    if data == "mq_back":
+        accs = bot.list_accounts()
+        context.user_data["all_accounts"] = accs
+        context.user_data["selected_accounts"] = set(context.user_data.get("selected_accounts", []))
+
+        lines = [
+            "🔄 **Multi-Account Quiz Setup**\n",
+            "Step 1/3: Select accounts for quiz rotation.\n",
+            f"Selected: {len(context.user_data['selected_accounts'])} / {len(accs)}\n",
+        ]
+
+        kb = []
+        selected = context.user_data["selected_accounts"]
+        for lbl in accs:
+            acc = bot.accounts[lbl]
+            ph = acc.get("phone") or "?"
+            icon = "✅" if lbl in selected else "⬜"
+            kb.append([
+                InlineKeyboardButton(f"{icon} {lbl} | {ph}", callback_data=f"mq_tgl:{lbl}")
+            ])
+        kb.append([
+            InlineKeyboardButton("✅ Select All", callback_data="mq_all"),
+            InlineKeyboardButton("❌ Clear All", callback_data="mq_none"),
+        ])
+        kb.append([
+            InlineKeyboardButton("➡️ Next (Set Quiz Level)", callback_data="mq_next1"),
+        ])
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
+        )
+        return WAIT_MULTI_QUIZ_ACCOUNTS
+
+    if data == "mq_start":
+        uid = query.from_user.id
+        busy_lock = get_user_busy_lock(uid)
+        if not busy_lock.acquire(blocking=False):
+            await query.answer("⏳ Pehle se ek task chal raha hai. Wait karo.", show_alert=True)
+            return WAIT_MULTI_QUIZ_CONFIRM
+
+        selected = context.user_data.get("selected_accounts", [])
+        level = context.user_data.get("quiz_level", 5)
+        max_rot = context.user_data.get("max_rotations")
+
+        rot_display = f"Max rotations: {max_rot}" if max_rot else "Max rotations: Auto"
+        msg = await query.message.reply_text(
+            f"🚀 Multi-Account Quiz STARTING...\n"
+            f"Accounts: {len(selected)} | Sessions/account: {level} | {rot_display}\n"
+            f"Initializing..."
+        )
+
+        loop = asyncio.get_running_loop()
+
+        def progress(text):
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(
+                        msg.edit_text(
+                            f"🔄 Multi-Account Quiz running…\n\n{str(text)[-1800:]}"
+                        )
+                    )
+                )
+            except Exception:
+                pass
+
+        def work():
+            return run_multi_account_quiz(
+                bot=bot,
+                telegram_user_id=uid,
+                selected_accounts=list(selected),
+                sessions_per_account=level,
+                progress_callback=progress,
+                max_rotations=max_rot,
+            )
+
+        result = await loop.run_in_executor(None, work)
+
+        summary_lines = ["🏁 **Multi-Account Quiz FINISHED**\n"]
+        if isinstance(result, dict):
+            summary_lines.append(f"Total rotation cycles completed: {result.get('rotations', 0)}")
+            summary_lines.append(f"Total sessions: {result.get('total_sessions', 0)}")
+            summary_lines.append(f"Total questions (est.): ~{result.get('total_questions', 0)}")
+            summary_lines.append(f"Total coins earned: ~{result.get('total_coins', 0)}")
+            summary_lines.append("")
+            per_acc = result.get("per_account", {})
+            if per_acc:
+                summary_lines.append("📊 **Per-Account Summary:**")
+                for lbl, info in per_acc.items():
+                    summary_lines.append(
+                        f"  • {lbl}: {info.get('sessions', 0)} sessions | {info.get('questions', 0)} qs | +{info.get('coins', 0)} coins | Bal: {info.get('balance', '?')}"
+                    )
+        else:
+            summary_lines.append(f"Result: {result}")
+
+        try:
+            await msg.edit_text("\n".join(summary_lines), parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        except Exception:
+            await query.message.reply_text("\n".join(summary_lines), parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+        try:
+            busy_lock.release()
+        except Exception:
+            pass
+        return ConversationHandler.END
+
+    return WAIT_MULTI_QUIZ_CONFIRM
+
+
+def run_multi_account_quiz(
+    bot,
+    telegram_user_id=None,
+    selected_accounts=None,
+    sessions_per_account=1,
+    progress_callback=None,
+    max_rotations=None,
+):
+    running_summary: Dict[str, str] = {}
+
+    def _build_summary_header() -> str:
+        if not running_summary:
+            return ""
+        sorted_lines = [running_summary.get(l, "") for l in (selected_accounts or []) if running_summary.get(l)]
+        if not sorted_lines:
+            sorted_lines = list(running_summary.values())
+        if not sorted_lines:
+            return ""
+        return "📊 **Running Per-Account:**\n" + "\n".join(sorted_lines[-8:]) + "\n\n--- Live Log ---\n"
+
+    def log(msg):
+        header = _build_summary_header()
+        full = f"{header}{str(msg)}"
+        if progress_callback:
+            try:
+                progress_callback(full)
+            except Exception:
+                pass
+        send_log_sync(f"<b>🔄 MULTI-ACCOUNT QUIZ</b> | User <code>{telegram_user_id}</code>\n{str(full)[:1800]}")
+
+    if not selected_accounts:
+        return {"error": "No accounts selected"}
+    if len(selected_accounts) < 1:
+        return {"error": "Min 1 account required"}
+
+    total_questions_global = 0
+    total_coins_global = 0
+    total_sessions_global = 0
+    rotations_done = 0
+    per_account_summary = {}
+
+    for lbl in selected_accounts:
+        acc = bot.accounts.get(lbl, {})
+        per_account_summary[lbl] = {
+            "questions": 0,
+            "coins": 0,
+            "sessions": 0,
+            "balance": acc.get("_cached_balance", "?"),
+            "rotations": 0,
+        }
+
+    if max_rotations is None:
+        max_rotations = max(1, int(10 / max(1, len(selected_accounts) * max(1, sessions_per_account))))
+        max_rotations = min(max_rotations, 5)
+
+    log(
+        f"🚀 STARTED\n"
+        f"Accounts: {len(selected_accounts)}\n"
+        f"Sessions per account: {sessions_per_account}\n"
+        f"Max rotation cycles: {max_rotations}\n"
+        f"Flow: Acc1 x{sessions_per_account} session(s) → Acc2 x{sessions_per_account} → ... → back to Acc1\n"
+        f"Accounts order: {' → '.join(selected_accounts)}\n"
+    )
+
+    for rot_num in range(1, max_rotations + 1):
+        log(f"--- 🔄 Rotation Cycle {rot_num}/{max_rotations} ---")
+        rotations_done += 1
+
+        stop_all = False
+        for acc_idx, lbl in enumerate(selected_accounts, 1):
+            if stop_all:
+                break
+
+            log(f"👤 Account {acc_idx}/{len(selected_accounts)}: <b>{lbl}</b>")
+            ok_switch, msg_switch = bot.switch_account(lbl)
+            if not ok_switch:
+                log(f"❌ Switch fail: {msg_switch}. Skip account.")
+                continue
+
+            try:
+                bal_before = bot.get_balance_silent()
+            except Exception:
+                bal_before = 0
+
+            try:
+                bot.open_app()
+            except Exception:
+                pass
+
+            status = bot.get_quiz_status()
+            daily = (status or {}).get("dailyAttempts", {}) or {}
+            if daily.get("exhausted"):
+                log(f"⚠️ Account {lbl}: Daily attempts exhausted. Skip.")
+                per_account_summary[lbl]["balance"] = bal_before
+                continue
+
+            info = per_account_summary[lbl]
+            acc_sess_done = 0
+            while acc_sess_done < sessions_per_account and not stop_all:
+                log(
+                    f"   🎯 Session {acc_sess_done+1}/{sessions_per_account} on this account "
+                    f"(FULL session — hearts=0 / session end tak — no question limit)"
+                )
+
+                try:
+                    result = bot.run_quiz_auto(
+                        max_sessions=1,
+                        question_delay=QUIZ_QUESTION_DELAY,
+                        progress_callback=progress_callback,
+                        telegram_user_id=telegram_user_id,
+                    )
+                except Exception as e:
+                    log(f"   ❌ Quiz exception: {e}")
+                    result = None
+
+                if isinstance(result, dict) and "error" in result:
+                    err = result["error"]
+                    log(f"   ⚠️ Quiz stopped: {err}")
+                    if "exhausted" in str(err).lower() or "daily" in str(err).lower():
+                        stop_all = True
+                    break
+
+                sess_q = 0
+                sess_coins = 0
+                real_sessions = 0
+                if isinstance(result, dict):
+                    real_sessions = int(result.get("sessions", 0) or 0)
+                    sess_coins = int(result.get("total_coins", 0) or 0)
+                    if real_sessions > 0:
+                        sess_q = max(1, int(real_sessions * 5))
+
+                if real_sessions == 0:
+                    real_sessions = 1
+
+                acc_sess_done += real_sessions
+                total_sessions_global += real_sessions
+                total_questions_global += sess_q
+                total_coins_global += sess_coins
+
+                info["sessions"] += real_sessions
+                info["questions"] += sess_q
+                info["coins"] += sess_coins
+                info["rotations"] += 1
+
+                try:
+                    bal_now = bot.get_balance_silent()
+                    info["balance"] = bal_now
+                except Exception:
+                    pass
+
+                log(
+                    f"   ✅ Session done: {sess_q} qs | +{sess_coins} coins | "
+                    f"Bal: {info.get('balance', '?')} | "
+                    f"Sessions on this acc: {info['sessions']}/{sessions_per_account}"
+                )
+
+                if total_sessions_global and total_sessions_global % 5 == 0:
+                    short_sleep(random.randint(800, 2500))
+
+                if acc_sess_done < sessions_per_account and not stop_all:
+                    inter_s_s = random.uniform(2.0, 8.0)
+                    log(f"   ⏸️ Next session on same account in {inter_s_s:.1f}s...")
+                    time.sleep(inter_s_s)
+
+            try:
+                bot._store_current_account(label=lbl)
+            except Exception:
+                pass
+
+            try:
+                info = per_account_summary[lbl]
+                running_summary[lbl] = (
+                    f"📊 {lbl}: {info.get('sessions', 0)}sess | "
+                    f"+{info.get('coins', 0)}coins | "
+                    f"Bal: {info.get('balance', '?')}"
+                )
+            except Exception:
+                pass
+
+            if not stop_all and acc_idx < len(selected_accounts):
+                cool_ms = random.randint(300, 1200)
+                log(f"   ⏸️ Cool-off {cool_ms}ms before next account...")
+                short_sleep(cool_ms)
+
+        if not stop_all and rot_num < max_rotations:
+            cool_s = random.uniform(3.0, 10.0)
+            log(f"⏸️ Rotation Cycle {rot_num} done. Cool-off {cool_s:.1f}s before next cycle...")
+            time.sleep(cool_s)
+
+    final_summary = (
+        f"🏁 FINISHED\n"
+        f"Rotation cycles: {rotations_done}\n"
+        f"Total sessions: {total_sessions_global}\n"
+        f"Total questions: ~{total_questions_global}\n"
+        f"Total coins: ~{total_coins_global}\n"
+        f"Per-account stats logged above."
+    )
+    log(final_summary)
+
+    return {
+        "rotations": rotations_done,
+        "total_sessions": total_sessions_global,
+        "total_questions": total_questions_global,
+        "total_coins": total_coins_global,
+        "per_account": per_account_summary,
+    }
 
 
 async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4610,126 +6158,161 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text == "💰 Balance":
         await balance_cmd(update, context)
-    elif text == "📊 Campaign":
-        await campaign_cmd(update, context)
     elif text == "👥 Accounts":
         await accounts_cmd(update, context)
     elif text == "➕ Login":
         await login_start(update, context)
-    elif text == "🎬 Browse Series":
-        await series_cmd(update, context)
-    elif text == "🎬 Watch All (4x)":
-        await watch_cmd(update, context)
     elif text == "🧠 Quiz Status":
         await quiz_status_cmd(update, context)
     elif text == "🤖 Run Quiz":
         return await quiz_run_start(update, context)
+    elif text == "🔄 Multi-Account Quiz":
+        return await multi_quiz_start(update, context)
     elif text == "🔑 Set Groq Key":
         await update.message.reply_text(
             "Apna Groq key bhejo:\n`/setgroq gsk_xxxxxxxx`\n\n"
-            "Free key: https://console.groq.com/keys",
-            parse_mode="Markdown",
-        )
-    elif text == "🔑 Token Login":
-        await update.message.reply_text(
-            "*Token Login (2 Methods)*\n\n"
-
-            "Method 1 (Fast): `/tokenlogin <your_token>`\n"
-            "Example:\n"
-            "`/tokenlogin eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQi...`\n\n"
-
-            "Method 2 (Interactive): /login → tap *🔑 Bearer Token*\n\n"
-
-            "*Token Properties:*\n"
-            "• JWT hamesha `eyJ` se start hota hai\n"
-            "• Length ~ 200-500 chars\n"
-            "• HTTP Toolkit/Fiddler se MiniPix ke request ka "
-            "`Authorization: Bearer <TOKEN>` header pakad ke nikalo.\n\n"
-
-            "Full help: /help",
-            parse_mode="Markdown",
-        )
-    elif text == "ℹ️ Help":
-        await help_cmd(update, context)
-    else:
-        await update.message.reply_text("Unknown. Use /help")
-
-
-def main():
-    acquire_lock()
-
-    if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: Set TELEGRAM_BOT_TOKEN")
-        return
-
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    login_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],
-        states={
-            WAIT_PHONE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)
+            "Free key: https://console.groq.com/keys", 
+            parse_mode="Markdown", 
+        ) 
+    elif text == "🔑 Token Login": 
+        await update.message.reply_text( 
+            "*Token Login (2 Methods)*\n\n" 
+ 
+            "Method 1 (Fast): `/tokenlogin <your_token>`\n" 
+            "Example:\n" 
+            "`/tokenlogin eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQi...`\n\n" 
+ 
+            "Method 2 (Interactive): /login → tap *🔑 Bearer Token*\n\n" 
+ 
+            "*Token Properties:*\n" 
+            "• JWT hamesha `eyJ` se start hota hai\n" 
+            "• Length ~ 200-500 chars\n" 
+            "• HTTP Toolkit/Fiddler se MiniPix ke request ka " 
+            "`Authorization: Bearer <TOKEN>` header pakad ke nikalo.\n\n" 
+ 
+            "Full help: /help", 
+            parse_mode="Markdown", 
+        ) 
+    elif text == "ℹ️ Help": 
+        await help_cmd(update, context) 
+    else: 
+        await update.message.reply_text("Unknown. Use /help") 
+ 
+ 
+def main(): 
+    acquire_lock() 
+ 
+    if not TELEGRAM_BOT_TOKEN: 
+        print("ERROR: Set TELEGRAM_BOT_TOKEN") 
+        return 
+ 
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build() 
+ 
+    login_conv = ConversationHandler( 
+        entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")], 
+        states={ 
+            WAIT_PHONE: [ 
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone) 
+            ], 
+            WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)], 
+            WAIT_TOKEN: [ 
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_token) 
+            ], 
+        }, 
+        fallbacks=[CommandHandler("cancel", cancel)], 
+        allow_reentry=True, 
+    ) 
+ 
+    quiz_conv = ConversationHandler( 
+        entry_points=[ 
+            CommandHandler("quizrun", quiz_run_start), 
+            MessageHandler(filters.Regex("^🤖 Run Quiz$"), quiz_run_start), 
+        ], 
+        states={ 
+            WAIT_QUIZ_SESSIONS: [ 
+                MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_sessions) 
+            ], 
+            WAIT_RUNQUIZ_SESSIONS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_sessions_handler),
             ],
-            WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
-            WAIT_TOKEN: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, login_token)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    quiz_conv = ConversationHandler(
+        }, 
+        fallbacks=[CommandHandler("cancel", cancel)], 
+        allow_reentry=True, 
+    ) 
+ 
+    multi_quiz_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("quizrun", quiz_run_start),
-            MessageHandler(filters.Regex("^🤖 Run Quiz$"), quiz_run_start),
+            CommandHandler("multiquiz", multi_quiz_start),
+            MessageHandler(filters.Regex("^🔄 Multi-Account Quiz$"), multi_quiz_start),
         ],
         states={
-            WAIT_QUIZ_SESSIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_sessions)
+            WAIT_MULTI_QUIZ_ACCOUNTS: [
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_tgl:"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_all$"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_none$"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_next1$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, multi_quiz_start),
+            ],
+            WAIT_MULTI_QUIZ_LEVEL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, multi_quiz_level),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_tgl:"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_all$"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_none$"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_next1$"),
+            ],
+            WAIT_MULTI_QUIZ_TOTAL_ROTATIONS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, multi_quiz_total_rotations),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_tgl:"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_all$"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_none$"),
+                CallbackQueryHandler(multi_quiz_account_callback, pattern=r"^mq_next1$"),
+            ],
+            WAIT_MULTI_QUIZ_CONFIRM: [
+                CallbackQueryHandler(multi_quiz_confirm_callback, pattern=r"^mq_start$"),
+                CallbackQueryHandler(multi_quiz_confirm_callback, pattern=r"^mq_back$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, multi_quiz_total_rotations),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("multiquiz", multi_quiz_start),
+        ],
         allow_reentry=True,
+        per_message=False,
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("balance", balance_cmd))
-    app.add_handler(CommandHandler("campaign", campaign_cmd))
-    app.add_handler(CommandHandler("accounts", accounts_cmd))
-    app.add_handler(CommandHandler("useaccount", useaccount_cmd))
-    app.add_handler(CommandHandler("reloadaccounts", reloadaccounts_cmd))
-    app.add_handler(CommandHandler("login", login_start))
-    app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd))
-    app.add_handler(CommandHandler("series", series_cmd))
-    app.add_handler(CommandHandler("watch", watch_cmd))
-    app.add_handler(CommandHandler("quiz", quiz_status_cmd))
-    app.add_handler(CommandHandler("setgroq", set_groq))
-    app.add_handler(CommandHandler("mygroq", my_groq))
-    app.add_handler(CommandHandler("addkey", add_key_cmd))
-    app.add_handler(CommandHandler("listkeys", list_keys_cmd))
-    app.add_handler(CommandHandler("removekey", remove_key_cmd))
-    app.add_handler(CommandHandler("setkeys", set_keys_cmd))
-    app.add_handler(CommandHandler("logout", logout_cmd))
-    app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(sw|rm):"))
-    app.add_handler(
-        CallbackQueryHandler(
-            series_callback,
-            pattern=r"^(sr_(pg|sel|ep|all4x|noop|back))",
-        )
-    )
-    app.add_handler(login_conv)
-    app.add_handler(quiz_conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    print("Bot starting (lock acquired). Unified mode.")
-    if LOG_CHANNEL_ID:
-        print(f"Log/DATA channel enabled: {LOG_CHANNEL_ID}")
-    else:
-        print("WARNING: LOG_CHANNEL_ID not set")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+    app.add_handler(multi_quiz_conv)
+    app.add_handler(login_conv) 
+    app.add_handler(quiz_conv) 
+    app.add_handler(CommandHandler("start", start)) 
+    app.add_handler(CommandHandler("help", help_cmd)) 
+    app.add_handler(CommandHandler("balance", balance_cmd)) 
+    app.add_handler(CommandHandler("accounts", accounts_cmd)) 
+    app.add_handler(CommandHandler("useaccount", useaccount_cmd)) 
+    app.add_handler(CommandHandler("reloadaccounts", reloadaccounts_cmd)) 
+    app.add_handler(CommandHandler("importaccounts", importaccounts_cmd)) 
+    app.add_handler(CommandHandler("login", login_start)) 
+    app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd)) 
+    app.add_handler(CommandHandler("quiz", quiz_status_cmd)) 
+    app.add_handler(CommandHandler("setgroq", set_groq)) 
+    app.add_handler(CommandHandler("mygroq", my_groq)) 
+    app.add_handler(CommandHandler("addkey", add_key_cmd)) 
+    app.add_handler(CommandHandler("listkeys", list_keys_cmd)) 
+    app.add_handler(CommandHandler("removekey", remove_key_cmd)) 
+    app.add_handler(CommandHandler("setkeys", set_keys_cmd)) 
+    app.add_handler(CommandHandler("multiquiz", multi_quiz_start))
+    app.add_handler(CommandHandler("logout", logout_cmd)) 
+    app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(sw|rm):")) 
+    app.add_handler(MessageHandler(filters.Document.ALL, json_document_handler)) 
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router)) 
+ 
+    print("Bot starting (lock acquired). Unified mode.") 
+    if LOG_CHANNEL_ID: 
+        print(f"Log/DATA channel enabled: {LOG_CHANNEL_ID}") 
+    else: 
+        print("WARNING: LOG_CHANNEL_ID not set") 
+    app.run_polling(allowed_updates=Update.ALL_TYPES) 
+ 
+ 
+if __name__ == "__main__": 
+    main() 
