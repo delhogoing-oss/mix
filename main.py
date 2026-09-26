@@ -251,8 +251,8 @@ if _PY_313_PLUS:
 
 # ───────────────────────── Config ─────────────────────────
 API_BASE = "https://api.minipix.co/v4"
-ACCOUNTS_FILE = "minipix_accounts.json"
-USER_GROQ_FILE = "user_groq_keys.json"
+ACCOUNTS_FILE = "minipix_account.json"
+USER_GROQ_FILE = "user_groq_key.json"
 LOCK_FILE = "bot.lock"
 
 MAX_WATCHES_PER_EP = 1
@@ -420,7 +420,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-(WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS, WAIT_MULTI_QUIZ_ACCOUNTS, WAIT_MULTI_QUIZ_LEVEL, WAIT_MULTI_QUIZ_CONFIRM, WAIT_RUNQUIZ_SESSIONS, WAIT_MULTI_QUIZ_TOTAL_ROTATIONS) = range(9)
+(WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS, WAIT_MULTI_QUIZ_ACCOUNTS, WAIT_MULTI_QUIZ_LEVEL, WAIT_MULTI_QUIZ_CONFIRM, WAIT_RUNQUIZ_SESSIONS, WAIT_MULTI_QUIZ_TOTAL_ROTATIONS, WAIT_TOKENLOGIN_TOKEN, WAIT_TOKEN_PHONE) = range(11)
 
 _accounts_lock = threading.Lock()
 _groq_lock = threading.Lock()
@@ -5119,119 +5119,210 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def tokenlogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        help_token = (
-            "*Usage:*\n"
-            "`/tokenlogin eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2Nz...xxxx`\n\n"
+async def tokenlogin_cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["tokenlogin_token"] = None
+    context.user_data["tokenlogin_phone"] = None
 
-            "*Token Properties:*\n"
-            "• *Always starts with*: `eyJ` (JWT format)\n"
-            "• *Length*: ~200 to 500 characters\n"
-            "• *Validity*: ~30 din ke baad expire hota hai\n\n"
+    token = None
+    if context.args:
+        token = " ".join(context.args).strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        if len(token) < 20:
+            token = None
 
-            "*Kaise Milega Token?*\n"
-            "HTTP Toolkit / Fiddler Classic se:\n"
-            "1. HTTP Toolkit/Fiddler start karo (SSL Proxy on)\n"
-            "2. MiniPix app open karo → login karo (OTP se)\n"
-            "3. App ka koi bhi request dekhna hai (jisme `Authorization` header ho)\n"
-            "4. Request headers me:\n"
-            "   `Authorization: Bearer eyJhbGciOiJIUzI1NiIs...`\n"
-            "5. `Bearer ` ke *baad* ka pura string copy karo → yehi apna TOKEN hai\n\n"
+    if token:
+        if not token.startswith("eyJ"):
+            await update.message.reply_text(
+                "⚠️ *Warning:* Token `eyJ` se start nahi ho raha (valid JWT nahi lag raha).\nTry kar raha hoon fir bhi...",
+                parse_mode="Markdown",
+            )
+        context.user_data["tokenlogin_token"] = token
 
-            "*Alternative method:*\n"
-            "Chat me `/login` → choose `🔑 Bearer Token` → token send karo.\n\n"
+        lines = [
+            "✅ Token received & validated (chhota check done).\n",
+            "🔐 **Step 2/2 — Is token kaunsa number belong karta hai?** Phone number bhejo:\n",
+            "  • 10 digits: `9876543210`\n",
+            "  • With +91: `+919876543210`\n",
+            "  • With 91 prefix without +: `919876543210`\n",
+            "\n💡 *Important:* Yehi number account label ke roop me use hoga.",
+            "Agar same number pehle se saved hai to `_2`, `_3` suffix lag ke NEW account entry banega (kabhi bhi existing entry overwrite nahi hoga!)",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return WAIT_TOKEN_PHONE
+    else:
+        help_token = [
+            "🔐 **Token Login (Step 1/2)** — Token bhejo:\n",
+            "*Token Properties:*",
+            "• *Always starts with*: `eyJ` (JWT format)",
+            "• *Length*: ~200 to 500 characters\n",
+            "*Kaise Milega Token?*",
+            "HTTP Toolkit / Fiddler Classic se:",
+            "1. HTTP Toolkit/Fiddler start karo (SSL Proxy on)",
+            "2. MiniPix app open karo → login karo (OTP se)",
+            "3. App ka koi bhi request dekhna hai (jisme `Authorization` header ho)",
+            "4. Request headers me:",
+            "   `Authorization: Bearer eyJhbGciOiJIUzI1NiIs...`",
+            "5. `Bearer ` ke *baad* ka pura string copy karo → yehi apna TOKEN hai\n",
+            "⚠️ *Note:* Bot auto-strips `Bearer ` prefix. Seedha `eyJ...` wala bhejo ya poora `Bearer eyJ...` dono chalega.\n",
+            "Ab token seedha chat me paste karo (ya command ke saath bhi de sakte ho `/tokenlogin <token>`):",
+        ]
+        await update.message.reply_text("\n".join(help_token), parse_mode="Markdown")
+        return WAIT_TOKENLOGIN_TOKEN
 
-            "⚠️ *Note:* Bot auto-strips `Bearer ` prefix. Seedha `eyJ...` wala bhejo ya poora `Bearer eyJ...` dono chalega."
-        )
-        await update.message.reply_text(help_token, parse_mode="Markdown")
-        return
-    token = " ".join(context.args).strip()
+
+async def tokenlogin_token_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    token = text
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
     if len(token) < 20:
         await update.message.reply_text(
-            "❌ Token too short (< 20 chars).\nReal JWT token hamesha `eyJ` se start hota hai aur 200+ characters ka hota hai.",
+            "❌ Token too short (< 20 chars).\nReal JWT token hamesha `eyJ` se start hota hai aur 200+ characters ka hota hai. Dobara bhejo ya /cancel."
         )
-        return
+        return WAIT_TOKENLOGIN_TOKEN
     if not token.startswith("eyJ"):
         await update.message.reply_text(
             "⚠️ *Warning:* Token `eyJ` se start nahi ho raha (valid JWT nahi lag raha).\n"
             "Try kar raha hoon fir bhi...",
             parse_mode="Markdown",
         )
-    bot = get_bot(update.effective_user.id)
-    ok = bot.login_with_token(token)
-    if ok:
-        try:
-            bot.open_app()
-        except Exception:
-            pass
-        try:
-            me_ok, me_raw = bot._req("GET", "/users/me")
-            if me_ok == 200 and isinstance(me_raw, dict):
-                try:
-                    fresh_uid = me_raw.get("_id") or me_raw.get("id") or me_raw.get("userId")
-                    if fresh_uid:
-                        bot.user_id = fresh_uid
-                except Exception:
-                    pass
-                try:
-                    fresh_prof = me_raw.get("master_profile") or me_raw.get("masterProfile") or me_raw.get("pid")
-                    if fresh_prof:
-                        bot.profile_id = fresh_prof
-                except Exception:
-                    pass
-                try:
-                    fresh_phone = me_raw.get("mobile") or me_raw.get("phone")
-                    if fresh_phone:
-                        bot.phone = fresh_phone
-                except Exception:
-                    pass
-                try:
-                    ref = me_raw.get("referralCode") or me_raw.get("referral_code")
-                    if ref:
-                        bot.referral_code = ref
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        bal = None
-        try:
-            bal = bot.get_balance()
-        except Exception:
-            bal = "?"
-        try:
-            bot._cached_balance = bal
-            lbl = bot.phone or bot.current_account_label or f"acc_{str(bot.user_id)[-6:]}"
-            bot.current_account_label = lbl
-            bot._store_current_account(label=lbl)
-        except Exception:
-            pass
-        send_log_sync(
-            f"✅ TOKEN LOGIN SUCCESS (Fresh profile fetched & saved)\n"
-            f"User ID: {bot.user_id}\n"
-            f"Phone: {bot.phone or '-'}\n"
-            f"referralCode: {getattr(bot, 'referral_code', None) or '-'}\n"
-            f"referredBy: {getattr(bot, 'referred_by', None) or '-'}\n"
-            f"source: {getattr(bot, 'login_source', None) or '-'}\n"
-            f"Balance: {bal}"
-        )
-        await update.message.reply_text(
-            f"✅ Token Login Success!\n"
-            f"Account: `{bot.phone or '-'}`\n"
-            f"💰 Balance: {bal}",
-            reply_markup=main_menu_keyboard(),
-            parse_mode="Markdown",
-        )
+    context.user_data["tokenlogin_token"] = token
+
+    lines = [
+        "✅ Token received & saved.\n",
+        "🔐 **Step 2/2 — Is token kaunsa number belong karta hai?** Phone number bhejo:\n",
+        "  • 10 digits: `9876543210`\n",
+        "  • With +91: `+919876543210`\n",
+        "\n💡 *Important:* Yehi number account label ke roop me use hoga.",
+        "Agar same number pehle se saved hai → suffix `_2`, `_3` lag ke NEW account entry banega (existing overwrite nahi hoga!)",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return WAIT_TOKEN_PHONE
+
+
+async def tokenlogin_phone_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_phone = (update.message.text or "").strip()
+    if not raw_phone:
+        await update.message.reply_text("❌ Phone bhejo (empty nahi). 10 digits ya with +91.")
+        return WAIT_TOKEN_PHONE
+
+    digits_only = re.sub(r"\D", "", raw_phone)
+    if len(digits_only) < 10:
+        await update.message.reply_text("❌ Phone me min 10 digits hone chahiye. Dobara bhejo ya /cancel.")
+        return WAIT_TOKEN_PHONE
+    if len(digits_only) == 12 and digits_only.startswith("91"):
+        clean_phone = "+91" + digits_only[2:]
+    elif len(digits_only) == 11 and digits_only.startswith("0"):
+        clean_phone = "+91" + digits_only[1:]
+    elif len(digits_only) == 10:
+        clean_phone = "+91" + digits_only
     else:
+        clean_phone = "+" + digits_only
+
+    token = context.user_data.get("tokenlogin_token")
+    if not token:
+        await update.message.reply_text("❌ Token lost. Please run `/tokenlogin` again from start.")
+        return ConversationHandler.END
+
+    uid = update.effective_user.id
+    bot = get_bot(uid)
+
+    try:
+        ok = bot.login_with_token(token)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Token login FAILED during token verify.\nError: {e}\nToken correct hai? Dobara HTTP Toolkit se naya capture karo."
+        )
+        return WAIT_TOKEN_PHONE
+
+    if not ok:
         await update.message.reply_text(
             "❌ Token login FAILED.\n"
             "Check:\n"
             "1. Token `eyJ` se start hota hai?\n"
             "2. Token complete paste kiya? (copy karte waqt last/start ka hissa na chop ho)\n"
-            "3. Token expire to nahi ho gaya? (dobara HTTP Toolkit se capture karo)\n"
+            "3. Token expire to nahi ho gaya? (dobara HTTP Toolkit se capture karo)\n\n"
+            "Naya token bhejo ya /cancel."
         )
+        return WAIT_TOKENLOGIN_TOKEN
+
+    try:
+        bot.open_app()
+    except Exception:
+        pass
+    try:
+        me_ok, me_raw = bot._req("GET", "/users/me")
+        if me_ok == 200 and isinstance(me_raw, dict):
+            try:
+                fresh_uid = me_raw.get("_id") or me_raw.get("id") or me_raw.get("userId")
+                if fresh_uid:
+                    bot.user_id = fresh_uid
+            except Exception:
+                pass
+            try:
+                fresh_prof = me_raw.get("master_profile") or me_raw.get("masterProfile") or me_raw.get("pid")
+                if fresh_prof:
+                    bot.profile_id = fresh_prof
+            except Exception:
+                pass
+            try:
+                ref = me_raw.get("referralCode") or me_raw.get("referral_code")
+                if ref:
+                    bot.referral_code = ref
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    bal = None
+    try:
+        bal = bot.get_balance()
+    except Exception:
+        bal = "?"
+
+    bot._cached_balance = bal
+    bot.phone = clean_phone
+
+    base_lbl = clean_phone
+    final_lbl = base_lbl
+    suffix_idx = 2
+    while final_lbl in bot.accounts:
+        final_lbl = f"{base_lbl}_{suffix_idx}"
+        suffix_idx += 1
+
+    bot.current_account_label = final_lbl
+    try:
+        bot._store_current_account(label=final_lbl)
+    except Exception:
+        pass
+
+    try:
+        send_log_sync(
+            f"✅ TOKEN LOGIN SUCCESS (New entry: {final_lbl}, phone={clean_phone})\n"
+            f"User ID: {bot.user_id}\n"
+            f"referralCode: {getattr(bot, 'referral_code', None) or '-'}\n"
+            f"Balance: {bal}"
+        )
+    except Exception:
+        pass
+
+    if final_lbl == base_lbl:
+        created_note = "🆕 New account created (fresh entry)."
+    else:
+        created_note = f"🆕 New account created (phone already existed → suffix used: `{final_lbl}`). Old account untouched ✓"
+
+    await update.message.reply_text(
+        f"✅ Token Login Success!\n"
+        f"Label: `{final_lbl}`\n"
+        f"Phone: `{clean_phone}`\n"
+        f"User ID: `{bot.user_id or '-'}`\n"
+        f"💰 Balance: {bal}\n\n"
+        f"{created_note}",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
 
 
 async def importaccounts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5733,95 +5824,111 @@ async def multi_quiz_account_callback(update: Update, context: ContextTypes.DEFA
 
 
 async def multi_quiz_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
     try:
-        level = int(text)
-        if level < 1:
-            level = 1
-        if level > 10:
-            level = 10
-    except Exception:
-        await update.message.reply_text("❌ Sirf ek valid number bhejo (1-10). Example: `1` = 1 session per account", parse_mode="Markdown")
+        import traceback
+        text = (update.message.text or "").strip()
+        try:
+            level = int(text)
+            if level < 1:
+                level = 1
+            if level > 10:
+                level = 10
+        except Exception:
+            await update.message.reply_text("❌ Sirf ek valid number bhejo (1-10). Example: `1` = 1 session per account", parse_mode="Markdown")
+            return WAIT_MULTI_QUIZ_LEVEL
+
+        context.user_data["quiz_level"] = level
+
+        sel_count = len(context.user_data.get("selected_accounts", []) or [])
+        lines = [
+            "🔄 Multi-Account Quiz Setup - Step 3/4\n",
+            f"✅ Step 1: {sel_count} accounts selected",
+            f"✅ Step 2: Level/Sessions per account = {level}\n",
+            "🔄 Kitne TOTAL rotation cycles chalaane hain?\n",
+            "  (Har 1 Cycle = sab selected accounts ko 1 baar level=N sessions complete karvana)\n",
+            "Examples:",
+            "  • 0 ya blank = Auto-calculate (recommended — based on accounts * level)",
+            "  • 2 = 2 full cycles",
+            "  • 5 = 5 full cycles",
+            "  • 20 = 20 full cycles (max 50)",
+            "",
+            "Sirf ek number bhejo (0-50):",
+        ]
+        await update.message.reply_text("\n".join(lines))
+        return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            await update.message.reply_text(f"❌ Multi-Quiz Level Step me Error:\n{e}\n\n{str(tb)[:1500]}")
+        except Exception:
+            pass
         return WAIT_MULTI_QUIZ_LEVEL
-
-    context.user_data["quiz_level"] = level
-
-    lines = [
-        "🔄 **Multi-Account Quiz Setup - Step 3/4**\n",
-        f"✅ Step 1: {len(context.user_data.get('selected_accounts', []))} accounts selected",
-        f"✅ Step 2: Level/Sessions per account = {level}\n",
-        "🔄 **Kitne TOTAL rotation cycles** chalaane hain?\n",
-        "  (Har 1 Cycle = sab selected accounts ko 1 baar level=N sessions complete karvana)\n",
-        "Examples:",
-        "  • `0` ya blank = Auto-calculate (recommended — based on accounts * level)",
-        "  • `2` = 2 full cycles",
-        "  • `5` = 5 full cycles",
-        "  • `20` = 20 full cycles (max 50)",
-        "",
-        "Sirf ek number bhejo (0-50):",
-    ]
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
 
 
 async def multi_quiz_total_rotations(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    max_rot = None
     try:
-        if text and text.lower() != "auto":
-            v = int(text)
-            if v < 0:
-                v = 0
-            if v > 50:
-                v = 50
-            if v > 0:
-                max_rot = v
-    except Exception:
-        await update.message.reply_text("❌ Sirf valid number bhejo (0-50). Auto ke liye 0 ya blank bhejo.", parse_mode="Markdown")
-        return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
-
-    context.user_data["max_rotations"] = max_rot
-
-    selected = context.user_data.get("selected_accounts", [])
-    level = context.user_data.get("quiz_level", 1)
-    bot = get_bot(update.effective_user.id)
-
-    lines = [
-        "🔄 **Multi-Account Quiz Setup - Final Confirmation (Step 4/4)**\n",
-        f"Selected Accounts ({len(selected)}):",
-    ]
-    for i, lbl in enumerate(selected, 1):
-        acc = bot.accounts.get(lbl, {})
-        ph = acc.get("phone") or "?"
+        text = (update.message.text or "").strip()
+        max_rot = None
         try:
-            bal = bot.accounts[lbl].get("_cached_balance", "?")
+            if text and text.lower() != "auto":
+                v = int(text)
+                if v < 0:
+                    v = 0
+                if v > 50:
+                    v = 50
+                if v > 0:
+                    max_rot = v
         except Exception:
-            bal = "?"
-        lines.append(f"  {i}. {lbl} | {ph} | Bal: {bal}")
-    
-    lines.append(f"\n🎯 Level (Sessions per account): {level}")
-    if max_rot is None:
-        lines.append(f"🔄 Total Rotation cycles: Auto (bot decide karega based on load)")
-    else:
-        lines.append(f"🔄 Total Rotation cycles: {max_rot}")
-    lines.append(f"🔄 Flow:")
-    lines.append(f"   Cycle 1: Acc1 → {level} session(s) → Acc2 → ...")
-    lines.append(f"   Cycle 2: Acc1 → {level} session(s) → Acc2 → ...")
-    lines.append(f"   ... until total cycles = {max_rot if max_rot else 'Auto'}")
-    lines.append(f"💾 Questions + server correctIndex saved to MongoDB cache → AI usage kam hoga")
-    lines.append("\nConfirm? Tap button below ya 'cancel' likho:")
+            await update.message.reply_text("❌ Sirf valid number bhejo (0-50). Auto ke liye 0 ya blank bhejo.")
+            return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 START Multi-Account Quiz", callback_data="mq_start")],
-        [InlineKeyboardButton("⬅️ Back to Account Select", callback_data="mq_back")],
-    ])
+        context.user_data["max_rotations"] = max_rot
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=kb,
-        parse_mode="Markdown",
-    )
-    return WAIT_MULTI_QUIZ_CONFIRM
+        selected = list(context.user_data.get("selected_accounts", []) or [])
+        level = context.user_data.get("quiz_level", 1)
+        bot = get_bot(update.effective_user.id)
+
+        lines = [
+            "🔄 Multi-Account Quiz Setup - Final Confirmation (Step 4/4)\n",
+            f"Selected Accounts ({len(selected)}):",
+        ]
+        for i, lbl in enumerate(selected, 1):
+            acc = bot.accounts.get(lbl, {})
+            ph = acc.get("phone") or "?"
+            try:
+                bal = (bot.accounts.get(lbl) or {}).get("_cached_balance", "?")
+            except Exception:
+                bal = "?"
+            lines.append(f"  {i}. {lbl} | {ph} | Bal: {bal}")
+
+        lines.append(f"\n🎯 Level (Sessions per account): {level}")
+        if max_rot is None:
+            lines.append("🔄 Total Rotation cycles: Auto (bot decide karega based on load)")
+        else:
+            lines.append(f"🔄 Total Rotation cycles: {max_rot}")
+        lines.append("🔄 Flow:")
+        lines.append(f"   Cycle 1: Acc1 -> {level} session(s) -> Acc2 -> ...")
+        lines.append(f"   Cycle 2: Acc1 -> {level} session(s) -> Acc2 -> ...")
+        lines.append(f"   ... until total cycles = {max_rot if max_rot else 'Auto'}")
+        lines.append("💾 Questions + server correctIndex saved to MongoDB cache -> AI usage kam hoga")
+        lines.append("\nConfirm? Tap button below ya 'cancel' likho:")
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 START Multi-Account Quiz", callback_data="mq_start")],
+            [InlineKeyboardButton("⬅️ Back to Account Select", callback_data="mq_back")],
+        ])
+
+        await update.message.reply_text("\n".join(lines), reply_markup=kb)
+        return WAIT_MULTI_QUIZ_CONFIRM
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            await update.message.reply_text(f"❌ Multi-Quiz Total-Rotations Step me Error:\n{e}\n\n{str(tb)[:1500]}")
+        except Exception:
+            pass
+        return WAIT_MULTI_QUIZ_TOTAL_ROTATIONS
 
 
 async def multi_quiz_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5897,6 +6004,19 @@ async def multi_quiz_confirm_callback(update: Update, context: ContextTypes.DEFA
             except Exception:
                 pass
 
+        def notify_new_message(text: str):
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(
+                        context.bot.send_message(
+                            chat_id=query.message.chat_id,
+                            text=str(text)[:4000],
+                        )
+                    )
+                )
+            except Exception:
+                pass
+
         def work():
             return run_multi_account_quiz(
                 bot=bot,
@@ -5904,6 +6024,7 @@ async def multi_quiz_confirm_callback(update: Update, context: ContextTypes.DEFA
                 selected_accounts=list(selected),
                 sessions_per_account=level,
                 progress_callback=progress,
+                notify_callback=notify_new_message,
                 max_rotations=max_rot,
             )
 
@@ -5946,9 +6067,11 @@ def run_multi_account_quiz(
     selected_accounts=None,
     sessions_per_account=1,
     progress_callback=None,
+    notify_callback=None,
     max_rotations=None,
 ):
     running_summary: Dict[str, str] = {}
+    last_notified_balances: Dict[str, str] = {}
 
     def _build_summary_header() -> str:
         if not running_summary:
@@ -6119,6 +6242,26 @@ def run_multi_account_quiz(
             except Exception:
                 pass
 
+            try:
+                if notify_callback:
+                    notify_lines = []
+                    notify_lines.append(f"📊 Session Done — Account Balance Update")
+                    notify_lines.append(f"Rotation Cycle: {rot_num}/{max_rotations}\n")
+                    for lbl_i in selected_accounts:
+                        info_i = per_account_summary.get(lbl_i, {})
+                        bal_i = info_i.get("balance", "?")
+                        sessions_i = info_i.get("sessions", 0)
+                        coins_i = info_i.get("coins", 0)
+                        if lbl_i == lbl:
+                            notify_lines.append(f"🔵 {lbl_i}: Sessions {sessions_i} | +{coins_i} coins | Bal: {bal_i}")
+                        else:
+                            notify_lines.append(f"⚪ {lbl_i}: Sessions {sessions_i} | +{coins_i} coins | Bal: {bal_i}")
+                    notify_lines.append("")
+                    notify_lines.append(f"Accounts rotated: {acc_idx}/{len(selected_accounts)}")
+                    notify_callback("\n".join(notify_lines))
+            except Exception:
+                pass
+
             if not stop_all and acc_idx < len(selected_accounts):
                 cool_ms = random.randint(300, 1200)
                 log(f"   ⏸️ Cool-off {cool_ms}ms before next account...")
@@ -6209,7 +6352,10 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build() 
  
     login_conv = ConversationHandler( 
-        entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")], 
+        entry_points=[
+            CallbackQueryHandler(login_callback, pattern=r"^login:"),
+            CommandHandler("tokenlogin", tokenlogin_cmd_start),
+        ], 
         states={ 
             WAIT_PHONE: [ 
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone) 
@@ -6218,6 +6364,12 @@ def main():
             WAIT_TOKEN: [ 
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_token) 
             ], 
+            WAIT_TOKENLOGIN_TOKEN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, tokenlogin_token_step),
+            ],
+            WAIT_TOKEN_PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, tokenlogin_phone_step),
+            ],
         }, 
         fallbacks=[CommandHandler("cancel", cancel)], 
         allow_reentry=True, 
@@ -6292,7 +6444,7 @@ def main():
     app.add_handler(CommandHandler("reloadaccounts", reloadaccounts_cmd)) 
     app.add_handler(CommandHandler("importaccounts", importaccounts_cmd)) 
     app.add_handler(CommandHandler("login", login_start)) 
-    app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd)) 
+    app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd_start)) 
     app.add_handler(CommandHandler("quiz", quiz_status_cmd)) 
     app.add_handler(CommandHandler("setgroq", set_groq)) 
     app.add_handler(CommandHandler("mygroq", my_groq)) 
