@@ -251,8 +251,8 @@ if _PY_313_PLUS:
 
 # ───────────────────────── Config ─────────────────────────
 API_BASE = "https://api.minipix.co/v4"
-ACCOUNTS_FILE = "minipix_account.json"
-USER_GROQ_FILE = "user_groq_key.json"
+ACCOUNTS_FILE = "minipix_accounts.json"
+USER_GROQ_FILE = "user_groq_keys.json"
 LOCK_FILE = "bot.lock"
 
 MAX_WATCHES_PER_EP = 1
@@ -656,7 +656,7 @@ def save_user_groq_keys(data: dict):
     try:
         col = _mongo_keys_col()
         if col is not None:
-            now_iso = datetime.utcnow().isoformat()
+            now_iso = datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
             for uid, keys in (data or {}).items():
                 if isinstance(keys, list):
                     keys_list = [k for k in keys if isinstance(k, str) and k]
@@ -693,7 +693,7 @@ def _save_groq_keys_for_user(user_id: str, keys_data):
             if keys_list:
                 col.replace_one(
                     {"telegram_user_id": user_id},
-                    {"telegram_user_id": user_id, "keys": keys_list, "updated_at": datetime.utcnow().isoformat()},
+                    {"telegram_user_id": user_id, "keys": keys_list, "updated_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()},
                     upsert=True,
                 )
             else:
@@ -877,7 +877,7 @@ class MiniPixV2:
             col = _mongo_accounts_col()
             if col is not None:
                 bot_id = (TELEGRAM_BOT_TOKEN[:12]) if TELEGRAM_BOT_TOKEN else None
-                now_iso = datetime.utcnow().isoformat()
+                now_iso = datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
                 for label, acc in (self.accounts or {}).items():
                     if not isinstance(acc, dict):
                         continue
@@ -3156,7 +3156,7 @@ class MiniPixV2:
                     "correct_index": idx_i,
                     "correct_text": correct_text_i,
                     "model_used": tag_i or "",
-                    "solved_at": datetime.utcnow().isoformat(),
+                    "solved_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
                     "hits": 0,
                 }
                 try:
@@ -3657,11 +3657,15 @@ class MiniPixV2:
                 if not result:
                     break
 
+                if not isinstance(result, dict):
+                    result = None
+                    break
+
                 mid_session_enabled_false = False
                 if isinstance(result, dict) and result.get("enabled") is False:
                     mid_session_enabled_false = True
 
-                if result.get("success") or mid_session_enabled_false:
+                if (isinstance(result, dict) and result.get("success")) or mid_session_enabled_false:
                     correct_flag = result.get("correct", False) if not mid_session_enabled_false else False
                     coins_earned_raw = result.get("coinsEarned")
                     try:
@@ -3731,7 +3735,7 @@ class MiniPixV2:
                                     "correct_index": correct_idx_server,
                                     "correct_text": correct_text_srv,
                                     "model_used": "server_ground_truth",
-                                    "server_confirmed_at": datetime.utcnow().isoformat(),
+                                    "server_confirmed_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
                                     "quiz_level": quiz_level_val,
                                     "ai_was_wrong": ai_was_wrong,
                                 }
@@ -3740,8 +3744,8 @@ class MiniPixV2:
                                         set_doc_srv["ai_corrected"] = True
                                         set_doc_srv["ai_prev_wrong_index"] = ai_choice_idx
                                     update_spec = {"$set": set_doc_srv, "$setOnInsert": {"hits": 0, "ai_corrections": 0}}
-                                    result = col_srv.update_one({"qhash": qhash_srv}, update_spec, upsert=True)
-                                    if result.matched_count > 0 and ai_was_wrong:
+                                    mongo_result = col_srv.update_one({"qhash": qhash_srv}, update_spec, upsert=True)
+                                    if getattr(mongo_result, "matched_count", 0) > 0 and ai_was_wrong:
                                         try:
                                             col_srv.update_one({"qhash": qhash_srv}, {"$inc": {"ai_corrections": 1}})
                                         except Exception:
@@ -3755,7 +3759,7 @@ class MiniPixV2:
                                             "correct_index": correct_idx_server,
                                             "correct_text": correct_text_srv,
                                             "model_used": "server_ground_truth",
-                                            "solved_at": datetime.utcnow().isoformat(),
+                                            "solved_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
                                             "ai_corrected": ai_was_wrong,
                                             "ai_was_wrong": ai_was_wrong,
                                             "quiz_level": quiz_level_val,
