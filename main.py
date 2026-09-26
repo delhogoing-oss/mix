@@ -3099,16 +3099,68 @@ class MiniPixV2:
                 except Exception:
                     doc = None
                 if doc is not None:
-                    idx = doc.get("correct_index")
-                    if isinstance(idx, int) and 0 <= idx < len(options):
+                    cached_text = (doc.get("correct_text") or "").strip()
+                    cached_idx = doc.get("correct_index")
+                    resolved_idx = None
+                    if cached_text:
+                        norm_cache_text = _normalize_text(cached_text)
+                        for live_i, live_opt in enumerate(options):
+                            if _normalize_text(live_opt or "") == norm_cache_text:
+                                resolved_idx = live_i
+                                break
+                        if resolved_idx is None and cached_text:
+                            for live_i, live_opt in enumerate(options):
+                                live_stripped = (live_opt or "").strip().lower()
+                                cache_stripped = cached_text.strip().lower()
+                                if live_stripped and cache_stripped and (live_stripped == cache_stripped or cache_stripped in live_stripped or live_stripped in cache_stripped):
+                                    resolved_idx = live_i
+                                    break
+                    if resolved_idx is None and isinstance(cached_idx, int) and 0 <= cached_idx < len(options):
                         try:
-                            col.update_one({"qhash": qhash}, {"$inc": {"hits": 1}})
+                            if cached_text:
+                                opt_at_idx = options[cached_idx] or ""
+                                norm_opt = _normalize_text(opt_at_idx)
+                                norm_txt = _normalize_text(cached_text)
+                                if norm_opt == norm_txt:
+                                    resolved_idx = cached_idx
+                                else:
+                                    resolved_idx = cached_idx
+                            else:
+                                resolved_idx = cached_idx
+                        except Exception:
+                            resolved_idx = cached_idx if isinstance(cached_idx, int) and 0 <= cached_idx < len(options) else None
+
+                    if resolved_idx is not None and 0 <= resolved_idx < len(options):
+                        is_fixed_by_text = cached_idx is not None and resolved_idx != int(cached_idx)
+                        try:
+                            if is_fixed_by_text:
+                                try:
+                                    col.update_one(
+                                        {"qhash": qhash},
+                                        {
+                                            "$set": {
+                                                "correct_index": int(resolved_idx),
+                                                "last_options": [str(o) for o in options],
+                                                "index_fixed_at": datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
+                                            }
+                                        }
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    col.update_one({"qhash": qhash}, {"$inc": {"hits": 1}})
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                         model_tag = doc.get("model_used", "cached") or "cached"
-                        tag = f"[CACHE] {model_tag}"
-                        correct_text = doc.get("correct_text", "") or (options[idx] if idx < len(options) else "")
-                        return idx, tag, correct_text
+                        if is_fixed_by_text:
+                            tag = f"[CACHE+FIX] {model_tag}"
+                        else:
+                            tag = f"[CACHE] {model_tag}"
+                        chosen_text = options[resolved_idx]
+                        return resolved_idx, tag, chosen_text
         except Exception:
             pass
 
